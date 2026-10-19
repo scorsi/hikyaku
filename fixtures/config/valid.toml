@@ -1,0 +1,26 @@
+node = "node-a"
+spool = "/var/lib/hikyaku"
+spool_limit = 1073741824
+listen_metrics = "127.0.0.1:9471"
+journald = true
+
+[targets.annai]
+url = "http://127.0.0.1:9153/metrics"
+interval = "30s"
+
+[targets.node]
+url = "http://127.0.0.1:9100/metrics"
+interval = "30s"
+max_series = 10000
+
+[masu]
+url = "https://192.0.2.10:9472"
+server_name = "masu.internal"
+ca_file = "/run/credentials/hikyaku.service/ca"
+token_file = "/run/credentials/hikyaku.service/token"
+
+[nisshi]
+url = "https://192.0.2.10:9473"
+server_name = "nisshi.internal"
+ca_file = "/run/credentials/hikyaku.service/ca"
+token_file = "/run/credentials/hikyaku.service/token"

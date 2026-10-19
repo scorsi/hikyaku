@@ -1,0 +1,3 @@
+node = "node-a"
+spool_limit = 1073741824
+spoolLimit = 1073741824

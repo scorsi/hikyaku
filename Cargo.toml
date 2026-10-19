@@ -1,0 +1,17 @@
+[package]
+name = "hikyaku"
+version = "0.1.0"
+edition = "2024"
+description = "Node agent of the observability stack: scrapes, logs, durable spool, push"
+
+# Direct dependencies are limited to ADR 0002.
+[dependencies]
+prost = "0.13"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+ureq = { version = "2", features = ["tls"] }
+zstd = "0.13"
+
+[build-dependencies]
+prost-build = "0.13"
