@@ -27,7 +27,7 @@ pub struct Config {
     pub nisshi: Option<Destination>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Target {
     pub url: String,
@@ -37,7 +37,7 @@ pub struct Target {
     pub max_series: u64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileInput {
     pub path: PathBuf,
