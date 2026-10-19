@@ -16,6 +16,66 @@
       };
       common = hikyaku.passthru.common;
       cargoArtifacts = craneLib.buildDepsOnly common;
+      # Module settings shared by the evaluations below (ADR 0007's example).
+      settings = {
+        enable = true;
+        node = "node-a";
+        spoolLimit = 1073741824;
+        targets.annai.url = "http://127.0.0.1:9153/metrics";
+        targets.node = {
+          url = "http://127.0.0.1:9100/metrics";
+          maxSeries = 10000;
+        };
+        masu = {
+          url = "https://192.0.2.10:9472";
+          serverName = "masu.internal";
+          caFile = "/run/secrets/observability-ca";
+          tokenFile = "/run/secrets/hikyaku-token";
+        };
+      };
+      # The darwin module against stubs of the nix-darwin options it sets (kekkai's pattern).
+      darwinEval =
+        let
+          stub = lib.mkOption { type = lib.types.attrsOf lib.types.anything; };
+        in
+        (lib.evalModules {
+          modules = [
+            inputs.self.darwinModules.default
+            {
+              config._module.args.pkgs = pkgs;
+              options = {
+                environment.systemPackages = lib.mkOption { type = lib.types.listOf lib.types.package; };
+                launchd.daemons = stub;
+                system.activationScripts = stub;
+              };
+              config.services.hikyaku = settings // {
+                files.kekkai-node.path = "/var/log/kekkai-node.log";
+              };
+            }
+          ];
+        }).config;
+      # The NixOS module in a full system (aarch64-linux when this system is Darwin): the
+      # drvPath forces every option and unit without building anything.
+      nixosEval = inputs.nixpkgs.lib.nixosSystem {
+        modules = [
+          inputs.self.nixosModules.default
+          {
+            nixpkgs.hostPlatform = if pkgs.stdenv.hostPlatform.isLinux then system else "aarch64-linux";
+            boot.loader.grub.enable = false;
+            fileSystems."/" = {
+              device = "none";
+              fsType = "tmpfs";
+            };
+            system.stateVersion = "26.05";
+            services.hikyaku = settings;
+          }
+        ];
+      };
+      linuxTests = lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux (
+        import ./tests {
+          inherit pkgs lib inputs;
+        }
+      );
     in
     {
       packages = {
@@ -62,7 +122,34 @@
           done
           touch $out
         '';
-      };
+
+        # Both modules evaluate; the rendered TOML passes `hikyaku check` and carries the
+        # options (ADR 0007).
+        modules-eval =
+          let
+            daemon = darwinEval.launchd.daemons.hikyaku.serviceConfig;
+            unit = nixosEval.config.systemd.services.hikyaku.serviceConfig;
+          in
+          assert daemon.KeepAlive && daemon.RunAtLoad;
+          assert lib.head daemon.ProgramArguments == lib.getExe hikyaku;
+          assert unit.MemoryMax == "64M" && unit.Type == "notify" && unit.Restart == "always";
+          assert
+            unit.LoadCredential == [
+              "masu-token:/run/secrets/hikyaku-token"
+              "masu-ca:/run/secrets/observability-ca"
+            ];
+          pkgs.runCommand "hikyaku-modules-eval" { } ''
+            toml=${darwinEval.services.hikyaku.configFile}
+            grep -q '^journald = false' $toml
+            grep -q '^max_series = 10000' $toml
+            grep -q '^\[files.kekkai-node\]' $toml
+            grep -q '^token_file = "/run/secrets/hikyaku-token"' $toml
+            grep -q '^server_name = "masu.internal"' $toml
+            ! grep -q nisshi $toml
+            echo ${builtins.unsafeDiscardStringContext nixosEval.config.system.build.toplevel.drvPath} > $out
+          '';
+      }
+      // linuxTests;
 
       treefmt = {
         projectRootFile = "flake.nix";

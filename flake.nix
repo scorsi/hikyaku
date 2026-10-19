@@ -44,6 +44,7 @@
 
       imports = [
         inputs.treefmt-nix.flakeModule
+        ./nix/modules.nix
         ./nix/perSystem.nix
       ];
     };
