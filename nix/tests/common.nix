@@ -49,18 +49,81 @@ in
         )
 
 
+    def sh(cmd):
+        # Diagnostics only: never fails, prints what it got.
+        status, out = machine.execute(cmd)
+        print(f"$ {cmd}  [exit {status}]\n{out.rstrip()}")
+        return out
+
+
+    def ranges(values):
+        out = []
+        for x in sorted(values):
+            if out and x == out[-1][1] + 1:
+                out[-1][1] = x
+            else:
+                out.append([x, x])
+        return out
+
+
+    def diagnose(services, n):
+        """On failure: counts, missing and duplicate `n` ranges with their spool neighbourhood,
+        journald's own counts, the agent's events, state, segments, journal files, metrics."""
+        print("=== diagnose ===")
+        ns = json.loads(machine.succeed(f"{DUMP} --signal logs | jq -s -c 'map(select(.service | IN({services})) | .n)'"))
+        counts = {}
+        for x in ns:
+            counts[x] = counts.get(x, 0) + 1
+        missing = ranges(set(range(1, n + 1)) - counts.keys())
+        dups = ranges([x for x, c in counts.items() if c > 1])
+        print(f"spooled {len(ns)}, distinct {len(counts)}, expected {n}")
+        print(f"missing {sum(b - a + 1 for a, b in missing)} in {len(missing)} ranges: {missing[:20]}")
+        print(f"duplicated {sum(b - a + 1 for a, b in dups)} in {len(dups)} ranges: {dups[:20]}")
+        for a, _ in (missing[:3] + dups[:3]):
+            sh(f"{DUMP} --signal logs | jq -c 'select(.n == {a - 1} or .n == {a})"
+               " | {seq, ts, service, n}'")
+        brief = "{seq, ts, service, event, n, from_ts, to_ts, fresh_spool, err}"
+        sh(f"{DUMP} --signal logs | jq -c 'select(.service == \"hikyaku\" and .event != \"heartbeat\") | {brief}'")
+        sh(f"{DUMP} --signal logs | jq -s -c 'map(.seq) as $s | [length, $s[0], $s[-1]]'")
+        for unit in json.loads(f"[{services}]"):
+            sh(f"journalctl -o cat _SYSTEMD_UNIT={unit}.service | wc -l")
+            sh(f"journalctl -o cat _SYSTEMD_UNIT={unit}.service | jq -s -c '[length, (map(.n) | unique | length), .[0].n, .[-1].n]'")
+        sh("journalctl -o cat MESSAGE_ID=a596d6fe7bfa4994828e72309e95d61e")
+        sh(f"{OWN} | grep -v '\"event\":\"heartbeat\"' | tail -n 40")
+        sh("systemctl show hikyaku.service -p NRestarts -p ActiveState -p SubState -p Result -p MemoryPeak")
+        sh("cat /var/lib/hikyaku/state.json")
+        sh("ls -la /var/lib/hikyaku/logs /var/lib/hikyaku/metrics; du -sb /var/lib/hikyaku")
+        sh('c=$(jq -r .journal_cursor /var/lib/hikyaku/state.json); echo "$c";'
+           ' journalctl -o json --cursor="$c" --lines=3 | jq -c "{__CURSOR, _SYSTEMD_UNIT, MESSAGE}"')
+        for cmd in ["journalctl --list-boots", "journalctl --disk-usage", "ls -la /var/log/journal/*", "ls -la /run/log/journal/*"]:
+            sh(cmd)
+        sh("journalctl -b -1 -n 3 -o short-iso-precise")
+        sh("curl -s http://127.0.0.1:9471/metrics | grep -v '^#'")
+        print("=== end diagnose ===")
+
+
     def wait_generated(services, n):
-        machine.wait_until_succeeds(
-            f"{DUMP} --signal logs | jq -s 'map(select(.service | IN({services})) | .n) | length == {n}' | grep -qx true",
-            timeout=600,
-        )
+        try:
+            machine.wait_until_succeeds(
+                f"{DUMP} --signal logs | jq -s 'map(select(.service | IN({services})) | .n) | length == {n}' | grep -qx true",
+                timeout=600,
+            )
+        except Exception:
+            diagnose(services, n)
+            raise
 
 
     def check_exact(services, n):
-        assert dump("logs", f"map(select(.service | IN({services})) | .n) | sort == [range(1; {n} + 1)]") == "true"
-        assert dump("logs", "map(.stream + \":\" + (.seq | tostring)) | length == (unique | length)") == "true"
-        assert dump("logs", "map(.seq) == [range(1; length + 1)]") == "true"
-        assert dump("logs", "map(.event) | index(\"journal-gap\") == null") == "true"
+        checks = {
+            "n exactly 1..N": dump("logs", f"map(select(.service | IN({services})) | .n) | sort == [range(1; {n} + 1)]"),
+            "(stream, seq) unique": dump("logs", "map(.stream + \":\" + (.seq | tostring)) | length == (unique | length)"),
+            "seq dense from 1": dump("logs", "map(.seq) == [range(1; length + 1)]"),
+            "no journal-gap": dump("logs", "map(.event) | index(\"journal-gap\") == null"),
+        }
+        failed = [k for k, v in checks.items() if v != "true"]
+        if failed:
+            diagnose(services, n)
+        assert not failed, failed
 
 
     def own_events(event):
