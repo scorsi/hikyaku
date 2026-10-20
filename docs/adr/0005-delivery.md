@@ -60,6 +60,8 @@ implementations must cost one record, not a stream.
 - **Loud, not blocking**: an `error` event `record-rejected` (`signal`, `seq`, `reason`) in the
   agent's own journal and logs stream, `hikyaku_rejected_records_total{signal,reason}`, and
   the stored `rejected` record itself at `level:"error"`.
+  Event fields amended by [ADR 0010](0010-delivery-event-fields.md): `rejected_seq`, not
+  `seq`; the stopped-stream and other push failures are named there.
 - **Guard**: if the store refuses the replacement too, the two validators disagree on the
   minimal record itself: the stream stops and retries every 5 minutes, as for a request-level
   400.

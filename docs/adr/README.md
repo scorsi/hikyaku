@@ -14,4 +14,4 @@ Decision / Consequences. A decision is changed by a new ADR that supersedes the 
 | [0007](0007-configuration-and-modules.md) | Configuration and modules |
 | [0008](0008-testing.md) | Testing |
 | [0009](0009-own-scrape-while-paused.md) | The agent's own scrape while the spool is paused (rejected) |
-| [0010](0010-delivery-event-fields.md) | Fields of the agent's delivery events (proposed) |
+| [0010](0010-delivery-event-fields.md) | Fields of the agent's delivery events |

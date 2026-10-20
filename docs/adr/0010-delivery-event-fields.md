@@ -1,6 +1,6 @@
 # ADR 0010 — Fields of the agent's delivery events
 
-Status: proposed — 2026-10-20
+Status: Accepted — 2026-10-20
 
 ## Context
 
@@ -10,7 +10,7 @@ agent's field (nisshi log-schema.md): a second `seq` member is `duplicate-field:
 record would be refused by the spool's own check and wrapped as `unparsed` (seen in a unit
 test of M2). ADR 0005 also asks for an `error` event on a stopped stream without naming it.
 
-## Decision (applied in M2, pending approval)
+## Decision
 
 - `record-rejected` (`level:"error"`): `signal`, `rejected_seq`, `reason`.
 - `replacement-rejected` (`error`): the store refused the replacement too, the stream stops;
