@@ -45,7 +45,7 @@ in
 
     def generate(unit, start, count, rate=2000, pad=0):
         machine.succeed(
-            f"systemd-run --unit={unit} --property=LogRateLimitIntervalSec=0 gen {start} {count} {rate} {pad}"
+            f"systemd-run --unit={unit} gen {start} {count} {rate} {pad}"
         )
 
 
@@ -150,9 +150,13 @@ in
       # The test instrumentation forwards every journal entry to the 115200-baud serial
       # console, synchronously: journald then stores ~100 lines/s and lags the generators by
       # minutes. A drop-in overrides journald.conf; failures (notice and above) stay visible.
+      # No default rate limit: a generator must reach the journal whole (exactly-once checks).
+      # A unit's LogRateLimitIntervalSec=0 means "journald's default", not "off"; a unit that
+      # must be limited (journald-suppressed's flood) sets its own non-zero limit.
       environment.etc."systemd/journald.conf.d/console.conf".text = ''
         [Journal]
         MaxLevelConsole=notice
+        RateLimitIntervalSec=0
       '';
     };
 

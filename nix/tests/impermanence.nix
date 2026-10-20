@@ -3,37 +3,42 @@
 # from its declared configuration alone (ADR 0007).
 common:
 common.mkTest "impermanence" {
-  nodes.machine = {
-    imports = [ (common.machine { }) ];
-    virtualisation.diskImage = null;
-    # A persistent node keeps its machine-id: journalctl only reads the journal directory of
-    # the current one, so a new id per boot hides the previous boot (a real journal-gap).
-    environment.etc."machine-id".text = "6f2a1c9e4b7d4e0f8a3b5c6d7e8f9a0b\n";
-    virtualisation.emptyDiskImages = [
-      {
-        size = 1024;
-        driveConfig.deviceExtraOpts.serial = "spool";
-      }
-      {
-        size = 1024;
-        driveConfig.deviceExtraOpts.serial = "log";
-      }
-    ];
-    virtualisation.fileSystems."/var/lib/hikyaku" = {
-      device = "/dev/disk/by-id/virtio-spool";
-      fsType = "ext4";
-      autoFormat = true;
+  nodes.machine =
+    { pkgs, ... }:
+    {
+      imports = [ (common.machine { }) ];
+      virtualisation.diskImage = null;
+      # A persistent node keeps its machine-id: journalctl only reads the journal directory of
+      # the current one, so a new id per boot hides the previous boot (a real journal-gap).
+      environment.etc."machine-id".text = "6f2a1c9e4b7d4e0f8a3b5c6d7e8f9a0b\n";
+      virtualisation.emptyDiskImages = [
+        {
+          size = 1024;
+          driveConfig.deviceExtraOpts.serial = "spool";
+        }
+        {
+          size = 1024;
+          driveConfig.deviceExtraOpts.serial = "log";
+        }
+      ];
+      virtualisation.fileSystems."/var/lib/hikyaku" = {
+        device = "/dev/disk/by-id/virtio-spool";
+        fsType = "ext4";
+        autoFormat = true;
+      };
+      virtualisation.fileSystems."/var/log" = {
+        device = "/dev/disk/by-id/virtio-log";
+        fsType = "ext4";
+        autoFormat = true;
+      };
+      systemd.services.hikyaku.unitConfig.RequiresMountsFor = [
+        "/var/lib/hikyaku"
+        "/var/log"
+      ];
+      # Diagnostics: the state the agent saved when it stopped, kept on the persistent /var/log.
+      systemd.services.hikyaku.serviceConfig.ExecStopPost =
+        "+${pkgs.coreutils}/bin/cp /var/lib/hikyaku/state.json /var/log/hikyaku-state-at-stop.json";
     };
-    virtualisation.fileSystems."/var/log" = {
-      device = "/dev/disk/by-id/virtio-log";
-      fsType = "ext4";
-      autoFormat = true;
-    };
-    systemd.services.hikyaku.unitConfig.RequiresMountsFor = [
-      "/var/lib/hikyaku"
-      "/var/log"
-    ];
-  };
 
   testScript = ''
     ${common.prelude}
@@ -54,6 +59,9 @@ common.mkTest "impermanence" {
     machine.shutdown()
     machine.start()
     machine.wait_for_unit("hikyaku.service")
+    # The cursor saved at the previous boot's stop, and what journalctl finds there now.
+    sh('c=$(jq -r .journal_cursor /var/log/hikyaku-state-at-stop.json); echo "$c";'
+       ' journalctl -o json --cursor="$c" --lines=3 | jq -c "{__CURSOR, _BOOT_ID, _SYSTEMD_UNIT, MESSAGE}"')
     assert streams() == first, (streams(), first)
     generate("gen2", N + 1, N)
     machine.wait_until_fails("systemctl is-active gen2.service")

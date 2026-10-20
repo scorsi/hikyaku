@@ -31,7 +31,10 @@ common.mkTest "spool-full" {
     # The spool-full event is in the logs stream too, from the reserve (ADR 0003, 0004).
     assert int(dump("logs", 'map(select(.event == "spool-full")) | length')) >= 1
     machine.wait_until_fails("systemctl is-active gen1.service")
-    assert machine.succeed("journalctl -o cat _SYSTEMD_UNIT=gen1.service | wc -l").strip() == str(N)
+    in_journal = int(machine.succeed("journalctl -o cat _SYSTEMD_UNIT=gen1.service | wc -l"))
+    if in_journal != N:
+        sh("journalctl -o cat MESSAGE_ID=a596d6fe7bfa4994828e72309e95d61e")
+    assert in_journal == N, f"journald holds {in_journal} gen1 lines, expected {N}"
     spooled = int(dump("logs", 'map(select(.service == "gen1")) | length'))
     assert 0 < spooled < N, spooled
     # Batches are sized by the room left before 99 %: ingestion overshoots by one record, own
