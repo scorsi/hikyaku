@@ -39,19 +39,30 @@ pub enum Item {
 /// `journalctl` from the saved cursor (the entry at the cursor comes first and is skipped by
 /// the caller, or reveals a gap), or from the start of the boot for a fresh spool.
 pub fn spawn(cursor: Option<&str>) -> io::Result<Child> {
-    let mut cmd = Command::new("journalctl");
-    cmd.args([
+    Command::new("journalctl")
+        .args(args(cursor))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .spawn()
+}
+
+fn args(cursor: Option<&str>) -> Vec<String> {
+    let mut a: Vec<String> = [
         "--output=json",
         "--all",
         "--quiet",
         "--follow",
         "--lines=all",
-    ]);
+    ]
+    .map(String::from)
+    .into();
     match cursor {
-        Some(c) => cmd.arg(format!("--cursor={c}")),
-        None => cmd.arg("--boot"),
-    };
-    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).spawn()
+        // `--follow` alone implies `--boot` (the current boot, journalctl.c in systemd 260):
+        // from a cursor of the previous boot it would skip that boot's tail (journal-gap).
+        Some(c) => a.extend([format!("--cursor={c}"), "--boot=all".into()]),
+        None => a.push("--boot".into()),
+    }
+    a
 }
 
 /// One line of `journalctl -o json`. Fields journald could not print as UTF-8 strings come as
@@ -193,6 +204,15 @@ mod tests {
         );
         assert_eq!(classify(&parse_entry(OWN.as_bytes()).unwrap()), Item::Own);
         assert!(parse_entry(b"not json").is_none());
+    }
+
+    #[test]
+    fn resumes_across_boots() {
+        let a = args(Some("s=6b7a;i=1a2;b=9f;m=2d6e;t=65e5c0b2a8f04;x=1"));
+        assert!(a.contains(&"--cursor=s=6b7a;i=1a2;b=9f;m=2d6e;t=65e5c0b2a8f04;x=1".into()));
+        assert!(a.contains(&"--boot=all".into()), "{a:?}");
+        let a = args(None);
+        assert!(a.contains(&"--boot".into()) && !a.iter().any(|x| x.starts_with("--cursor")));
     }
 
     #[test]
