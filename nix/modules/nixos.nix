@@ -49,7 +49,13 @@ in
     systemd.services.hikyaku = {
       description = "hikyaku node agent";
       wantedBy = [ "multi-user.target" ];
-      after = [ "network.target" ];
+      # Stopped before journald gives /var/log/journal back at shutdown: entries written after
+      # that go to the volatile /run journal, and a cursor saved on one is a journal-gap at the
+      # next boot. No ordering reaches it otherwise (sysinit.target has no stop job).
+      after = [
+        "network.target"
+        "systemd-journal-flush.service"
+      ];
       # journalctl is a runtime dependency (ADR 0002).
       path = [ pkgs.systemd ];
       serviceConfig = {

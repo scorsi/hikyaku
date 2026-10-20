@@ -133,6 +133,7 @@
           assert daemon.KeepAlive && daemon.RunAtLoad;
           assert lib.head daemon.ProgramArguments == lib.getExe hikyaku;
           assert unit.MemoryMax == "64M" && unit.Type == "notify" && unit.Restart == "always";
+          assert lib.elem "systemd-journal-flush.service" nixosEval.config.systemd.services.hikyaku.after;
           assert
             unit.LoadCredential == [
               "masu-token:/run/secrets/hikyaku-token"
