@@ -300,8 +300,11 @@ rec {
   deliveryPrelude = nodes: ''
     import urllib.parse
 
-    NISSHI = "zstdcat /var/lib/nisshi/node-a/*.ndjson.zst 2>/dev/null"
-    MASU = "zstdcat /var/lib/masu/archive/node-a/*.ndjson.zst 2>/dev/null"
+    # The driver runs commands under `set -o pipefail`: a reader that stops early (`grep -q`)
+    # kills zstdcat with SIGPIPE and fails the pipeline once the data outgrows the pipe
+    # buffer, so zstdcat's own status never counts (no file yet reads as empty).
+    NISSHI = "{ zstdcat /var/lib/nisshi/node-a/*.ndjson.zst 2>/dev/null || true; }"
+    MASU = "{ zstdcat /var/lib/masu/archive/node-a/*.ndjson.zst 2>/dev/null || true; }"
     URLS = {"logs": "${nodes.machine.services.hikyaku.nisshi.url}", "metrics": "${nodes.machine.services.hikyaku.masu.url}"}
     ZEROS = "0" * 32
     UNIQUE = 'map(.stream + ":" + (.seq | tostring)) | length == (unique | length)'

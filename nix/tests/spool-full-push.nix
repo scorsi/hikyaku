@@ -23,7 +23,7 @@ common.mkDeliveryTest "spool-full-push" {
     machine.wait_until_succeeds(
         "curl -s http://127.0.0.1:9471/metrics | grep -qx 'hikyaku_spool_paused{signal=\"logs\"} 1'"
     )
-    machine.wait_until_succeeds(f"{OWN} | grep -q '\"event\":\"spool-full\"'")
+    machine.wait_until_succeeds(f"{OWN} | grep >/dev/null '\"event\":\"spool-full\"'")
     store.succeed("systemctl start masu.service nisshi.service")
     store.wait_for_open_port(9472)
     store.wait_for_open_port(9473)
