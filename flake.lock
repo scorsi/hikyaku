@@ -51,17 +51,17 @@
         ]
       },
       "locked": {
-        "type": "github",
-        "owner": "scorsi",
-        "repo": "masu",
-        "rev": "fe985972a490d18712838964986daf02a6b220f2",
-        "narHash": "sha256-KLpgEr7siFzMgimbi0gRr/fp+hMASVs+V6NSSqC8MIo=",
-        "lastModified": 1792429919
+        "lastModified": 1792517232,
+        "narHash": "sha256-0TxTaHG9umrnJiu2c5DNaXaWe0BryGslJVJYqAWfYxE=",
+        "ref": "refs/heads/main",
+        "rev": "a4e3dde572b49868cb5898ddaafd0202f046dfaa",
+        "revCount": 14,
+        "type": "git",
+        "url": "ssh://git@ishizue.tail9883f3.ts.net:2222/scorsi/masu.git"
       },
       "original": {
-        "type": "github",
-        "owner": "scorsi",
-        "repo": "masu"
+        "type": "git",
+        "url": "ssh://git@ishizue.tail9883f3.ts.net:2222/scorsi/masu.git"
       }
     },
     "nisshi": {
@@ -77,17 +77,17 @@
         ]
       },
       "locked": {
-        "type": "github",
-        "owner": "scorsi",
-        "repo": "nisshi",
-        "rev": "ad1caa9b12188914aa21e31d102b6ed4db4bb31a",
-        "narHash": "sha256-bkVkJPy5ZEbSF5SJUtTtj6Hw/mRK4AoF8yFUPnhueCw=",
-        "lastModified": 1792429895
+        "lastModified": 1792517216,
+        "narHash": "sha256-R1KI2uD6uLqVSqeBsDW66OspOA7HoUrrVdLog+dG00Q=",
+        "ref": "refs/heads/main",
+        "rev": "ce1e1ac72ff0fe8d34b94d1e1339cf989a67a365",
+        "revCount": 14,
+        "type": "git",
+        "url": "ssh://git@ishizue.tail9883f3.ts.net:2222/scorsi/nisshi.git"
       },
       "original": {
-        "type": "github",
-        "owner": "scorsi",
-        "repo": "nisshi"
+        "type": "git",
+        "url": "ssh://git@ishizue.tail9883f3.ts.net:2222/scorsi/nisshi.git"
       }
     },
     "nixpkgs": {
