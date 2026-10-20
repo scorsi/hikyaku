@@ -84,6 +84,13 @@ in
         enable = true;
         inherit spoolLimit;
       };
+      # The test instrumentation forwards every journal entry to the 115200-baud serial
+      # console, synchronously: journald then stores ~100 lines/s and lags the generators by
+      # minutes. A drop-in overrides journald.conf; failures (notice and above) stay visible.
+      environment.etc."systemd/journald.conf.d/console.conf".text = ''
+        [Journal]
+        MaxLevelConsole=notice
+      '';
     };
 
   mkTest =

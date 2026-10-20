@@ -6,6 +6,9 @@ common.mkTest "impermanence" {
   nodes.machine = {
     imports = [ (common.machine { }) ];
     virtualisation.diskImage = null;
+    # A persistent node keeps its machine-id: journalctl only reads the journal directory of
+    # the current one, so a new id per boot hides the previous boot (a real journal-gap).
+    environment.etc."machine-id".text = "6f2a1c9e4b7d4e0f8a3b5c6d7e8f9a0b\n";
     virtualisation.emptyDiskImages = [
       {
         size = 1024;
