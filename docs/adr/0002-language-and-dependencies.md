@@ -55,7 +55,8 @@ hand-written, as kekkai. Any other crate needs a new ADR.
 
 journald is read through a `journalctl --output=json --follow --after-cursor=<c>` child process
 in v0: no FFI, the cursor is journald's own. Binding libsystemd directly would save the child's
-5–10 MB; reconsidered with the M1 measurement on the VPS, through a new ADR.
+5–10 MB; reconsidered with the M1 measurement on the VPS, through a new ADR. The resume flags are
+in [ADR 0011](0011-journald-resume.md) (`--cursor`, `--boot=all`).
 
 ## Consequences
 

@@ -25,6 +25,8 @@ House services write one JSON object per line on stderr in nisshi's log schema (
 
 - `journalctl --output=json --follow --after-cursor=<saved cursor>` over all units. With no
   saved cursor (fresh spool): `--boot`, the start of the current boot.
+  Superseded in part by [ADR 0011](0011-journald-resume.md): the agent resumes with
+  `--cursor=<saved cursor> --boot=all`, not `--after-cursor`.
 - A line whose `MESSAGE` starts with `{` is validated **with exactly nisshi's rules**, before a
   `seq` is assigned: nisshi publishes them as fixtures (nisshi ADR 0004) and hikyaku's tests run
   every one of them against its validator. A valid line is kept as is and the agent adds

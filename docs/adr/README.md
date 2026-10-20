@@ -15,3 +15,4 @@ Decision / Consequences. A decision is changed by a new ADR that supersedes the 
 | [0008](0008-testing.md) | Testing |
 | [0009](0009-own-scrape-while-paused.md) | The agent's own scrape while the spool is paused (rejected) |
 | [0010](0010-delivery-event-fields.md) | Fields of the agent's delivery events |
+| [0011](0011-journald-resume.md) | journald resume: `--cursor` and `--boot=all` |
