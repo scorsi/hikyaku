@@ -272,12 +272,37 @@ rec {
       };
       # Test node only: kill -9 loops and configuration switches restart it often.
       systemd.services.hikyaku.startLimitIntervalSec = 0;
+      # Test node only: the agent logs at info and the console is notice-level, so its lines
+      # (push errors, panics) are copied to the console live: a hung or interrupted run shows
+      # them too. Written to the console directly, not through journald.
+      systemd.services.hikyaku-console = {
+        wantedBy = [ "multi-user.target" ];
+        before = [ "hikyaku.service" ];
+        path = [
+          pkgs.systemd
+          pkgs.gnugrep
+          pkgs.gnused
+        ];
+        script = ''
+          journalctl -b -f -n all -o cat _SYSTEMD_UNIT=hikyaku.service \
+            | grep --line-buffered -v '"event":"heartbeat"' | sed -u 's/^/hikyaku: /'
+        '';
+        serviceConfig = {
+          StandardOutput = "tty";
+          TTYPath = "/dev/console";
+          Restart = "always";
+        };
+      };
     };
 
-  # Python helpers of the M2 scripts: `machine` is the agent VM, `store` the store VM.
-  deliveryPrelude = ''
+  # Python helpers of the M2 scripts: `machine` is the agent VM, `store` the store VM. `URLS`
+  # are the agent's configured destinations (the diagnostics reach them as the agent does).
+  deliveryPrelude = nodes: ''
+    import urllib.parse
+
     NISSHI = "zstdcat /var/lib/nisshi/node-a/*.ndjson.zst 2>/dev/null"
     MASU = "zstdcat /var/lib/masu/archive/node-a/*.ndjson.zst 2>/dev/null"
+    URLS = {"logs": "${nodes.machine.services.hikyaku.nisshi.url}", "metrics": "${nodes.machine.services.hikyaku.masu.url}"}
     ZEROS = "0" * 32
     UNIQUE = 'map(.stream + ":" + (.seq | tostring)) | length == (unique | length)'
     # The agent's streams hold seq 1..max exactly (nisshi's own seq-gap records excluded).
@@ -288,13 +313,11 @@ rec {
         return store.succeed(f"{cmd} | jq -s -c '{jq}'").strip()
 
 
-    def status(port):
-        return json.loads(store.succeed(
-            "curl -sS --cacert ${certs}/ca.pem"
-            f" --resolve store.example.org:{port}:127.0.0.1"
-            " -H 'Authorization: Bearer ${tokens.reader}'"
-            f" https://store.example.org:{port}/v1/status"
-        ))
+    def status_cmd(port, host="127.0.0.1"):
+        return ("curl -sS --max-time 20 --cacert ${certs}/ca.pem"
+                f" --resolve store.example.org:{port}:{host}"
+                " -H 'Authorization: Bearer ${tokens.reader}'"
+                f" https://store.example.org:{port}/v1/status")
 
 
     def metric(text, sample):
@@ -318,30 +341,47 @@ rec {
         return machine.succeed(f"jq -r .streams.{signal}.stream /var/lib/hikyaku/state.json").strip()
 
 
+    def run_on(vm, cmd):
+        # Diagnostics only: never fails, prints what it got.
+        try:
+            status_, out = vm.execute(cmd, timeout=60)
+            print(f"{vm.name}$ {cmd}  [exit {status_}]\n{out.rstrip()}")
+        except Exception as e:
+            print(f"{vm.name}$ {cmd}  [failed: {e}]")
+
+
     def diagnose_delivery():
+        """Run by every M2 script on failure (mkDeliveryTest): the agent's view (its journal with
+        push errors and panics, counters, state, spool, network), each store's (journal, push
+        counters by code, /v1/status), and the agent VM's own TLS request to each destination."""
         print("=== diagnose delivery ===")
-        sh(f"{OWN} | grep -v '\"event\":\"heartbeat\"' | tail -n 40")
-        sh("curl -s http://127.0.0.1:9471/metrics | grep -v '^#'")
-        sh("cat /var/lib/hikyaku/state.json | jq -c '.streams, .paused, (.replacements | map_values(keys))'")
-        sh("ls -la /var/lib/hikyaku/logs /var/lib/hikyaku/metrics")
-        for cmd in [f"{NISSHI} | jq -s -c 'group_by(.service) | map([.[0].service, length])'",
-                    f"{MASU} | jq -s -c 'group_by(.service) | map([.[0].service, length])'",
-                    "journalctl -u masu -u nisshi -o cat | tail -n 20",
-                    "curl -s http://127.0.0.1:9474/metrics http://127.0.0.1:9475/metrics | grep push_requests"]:
-            status_, out = store.execute(cmd)
-            print(f"store$ {cmd}  [exit {status_}]\n{out.rstrip()}")
+        run_on(machine, f"{OWN} | grep -v '\"event\":\"heartbeat\"' | tail -n 80")
+        run_on(machine, f"{OWN} | jq -R -r 'fromjson? | select(.event == \"push-error\") | [.signal, .code, .err] | @tsv'"
+                        " | sort | uniq -c")
+        run_on(machine, "journalctl -u hikyaku.service -n 30 -o short-monotonic | grep -v '\"event\":\"heartbeat\"'")
+        run_on(machine, "systemctl show hikyaku.service -p ActiveState -p SubState -p NRestarts -p ExecMainStatus -p MemoryPeak")
+        run_on(machine, "curl -s http://127.0.0.1:9471/metrics | grep -v '^#'")
+        run_on(machine, "head -c 4000 /var/lib/hikyaku/state.json")
+        run_on(machine, "ls -la /var/lib/hikyaku /var/lib/hikyaku/logs /var/lib/hikyaku/metrics")
+        run_on(machine, "ip -br addr; ip route; ss -tn")
+        for signal, url in URLS.items():
+            u = urllib.parse.urlsplit(url)
+            run_on(machine, f"{status_cmd(u.port, u.hostname)} -v 2>&1 | tail -n 40")
+        run_on(store, "journalctl -u masu -u nisshi -u 'fakestore-*' -n 80 -o cat")
+        run_on(store, "curl -s http://127.0.0.1:9474/metrics http://127.0.0.1:9475/metrics | grep -v '^#'")
+        for port in (9472, 9473):
+            run_on(store, status_cmd(port))
+        run_on(store, "ss -tln; ls -laR /var/lib/nisshi /var/lib/masu | head -n 60")
+        run_on(store, f"{NISSHI} | jq -s -c 'group_by(.service) | map([.[0].service, length])'")
+        run_on(store, f"{MASU} | jq -s -c 'group_by(.service) | map([.[0].service, length])'")
         print("=== end diagnose delivery ===")
 
 
     def wait_stored(services, n, timeout=900):
-        try:
-            store.wait_until_succeeds(
-                f"{NISSHI} | jq -s 'map(select(.service | IN({services})) | .n) | length >= {n}' | grep -qx true",
-                timeout=timeout,
-            )
-        except Exception:
-            diagnose_delivery()
-            raise
+        store.wait_until_succeeds(
+            f"{NISSHI} | jq -s 'map(select(.service | IN({services})) | .n) | length >= {n}' | grep -qx true",
+            timeout=timeout,
+        )
 
 
     def check_stores(services, n):
@@ -354,8 +394,6 @@ rec {
             "masu: agent stream dense": stored(MASU, DENSE),
         }
         failed = [k for k, v in checks.items() if v != "true"]
-        if failed:
-            diagnose_delivery()
         assert not failed, failed
 
 
@@ -367,6 +405,31 @@ rec {
           inputs.masu.lib.validateMetrics.${system}
         } validate --metrics http://127.0.0.1:9471/metrics")
   '';
+
+  # An M2 test: `script` runs after both preludes, inside a try whose failure branch prints
+  # diagnose_delivery() before the traceback (a timed-out wait included).
+  mkDeliveryTest =
+    name:
+    { script, ... }@test:
+    mkTest name (
+      builtins.removeAttrs test [ "script" ]
+      // {
+        testScript =
+          { nodes, ... }:
+          ''
+            ${prelude}
+            ${deliveryPrelude nodes}
+            try:
+            ${lib.concatMapStringsSep "\n" (l: if l == "" then l else "    " + l) (lib.splitString "\n" script)}
+            except BaseException:
+                try:
+                    diagnose_delivery()
+                except BaseException as e:
+                    print(f"diagnose_delivery failed: {e!r}")
+                raise
+          '';
+      }
+    );
 
   mkTest =
     name: test:

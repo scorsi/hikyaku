@@ -2,13 +2,11 @@
 # while it pushes: every `n` once in nisshi, `(stream, seq)` unique and dense in both stores
 # (a batch cut by the kill is resent from acked_seq + 1, the stores drop what they had, ADR 0005).
 common:
-common.mkTest "kill-nine-push" {
+common.mkDeliveryTest "kill-nine-push" {
   nodes.machine = common.agent { };
   nodes.store = common.store;
 
-  testScript = ''
-    ${common.prelude}
-    ${common.deliveryPrelude}
+  script = ''
     import random
     import time
 

@@ -4,7 +4,7 @@
 # another certificate (no request reaches the stores, `error` event), then the right token:
 # everything spooled meanwhile is delivered.
 common:
-common.mkTest "auth" {
+common.mkDeliveryTest "auth" {
   nodes.machine =
     { lib, ... }:
     let
@@ -25,9 +25,7 @@ common.mkTest "auth" {
     };
   nodes.store = common.store;
 
-  testScript = ''
-    ${common.prelude}
-    ${common.deliveryPrelude}
+  script = ''
     import time
 
 

@@ -3,13 +3,11 @@
 # `n` is in nisshi once, the agent's 1 s scrapes cover the outage in masu, `(stream, seq)`
 # unique and dense in both, fully acked closed segments deleted (ADR 0005).
 common:
-common.mkTest "outage" {
+common.mkDeliveryTest "outage" {
   nodes.machine = common.agent { };
   nodes.store = common.store;
 
-  testScript = ''
-    ${common.prelude}
-    ${common.deliveryPrelude}
+  script = ''
     import time
     from datetime import datetime, timezone
 

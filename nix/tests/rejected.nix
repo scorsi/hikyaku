@@ -27,7 +27,7 @@ let
     marker_info 1
   '';
 in
-common.mkTest "rejected" {
+common.mkDeliveryTest "rejected" {
   nodes.store = {
     imports = [ common.store ];
     systemd.services.fakestore-masu = fakestore "masu" 9572 9472;
@@ -59,9 +59,7 @@ common.mkTest "rejected" {
     };
   };
 
-  testScript = ''
-    ${common.prelude}
-    ${common.deliveryPrelude}
+  script = ''
     import base64
     import time
 
@@ -91,14 +89,10 @@ common.mkTest "rejected" {
 
 
     def wait_replaced(cmd, stream, r, select):
-        try:
-            store.wait_until_succeeds(
-                f"{cmd} | jq -s -e 'any(.stream == \"{stream}\" and .seq == {r['seq']} and .raw_b64 == \"{r['b64']}\" and {select})'",
-                timeout=300,
-            )
-        except Exception:
-            diagnose_delivery()
-            raise
+        store.wait_until_succeeds(
+            f"{cmd} | jq -s -e 'any(.stream == \"{stream}\" and .seq == {r['seq']} and .raw_b64 == \"{r['b64']}\" and {select})'",
+            timeout=300,
+        )
 
 
     start_all()

@@ -6,13 +6,11 @@
 # pauses every scrape while the spool is full, the agent's own included, and the gauge is 0
 # again before the next scrape: no stored scrape can carry it. Proposed ADR 0009 answers it.
 common:
-common.mkTest "spool-full-push" {
+common.mkDeliveryTest "spool-full-push" {
   nodes.machine = common.agent { spoolLimit = 2097152; };
   nodes.store = common.store;
 
-  testScript = ''
-    ${common.prelude}
-    ${common.deliveryPrelude}
+  script = ''
     start_all()
     store.wait_for_unit("masu.service")
     store.wait_for_unit("nisshi.service")
@@ -33,19 +31,7 @@ common.mkTest "spool-full-push" {
     # The spool stays full once delivered: the open segment (under 16 MiB, younger than an
     # hour) is never deleted (ADR 0004, spool.md), so `paused` stays true in every push.
     for port in (9472, 9473):
-        try:
-            store.wait_until_succeeds(
-                "curl -sS --cacert ${common.certs}/ca.pem"
-                f" --resolve store.example.org:{port}:127.0.0.1"
-                " -H 'Authorization: Bearer test-token-reader'"
-                f" https://store.example.org:{port}/v1/status"
-                " | jq -e '.agents[\"node-a\"].paused == true'",
-                timeout=600,
-            )
-        except Exception:
-            print(status(port))
-            diagnose_delivery()
-            raise
+        store.wait_until_succeeds(f"{status_cmd(port)} | jq -e '.agents[\"node-a\"].paused == true'", timeout=600)
     store.wait_until_succeeds(
         f"{MASU} | jq -s -e 'any(.service == \"hikyaku\" and .error == \"skipped-spool-full\")'", timeout=600
     )
