@@ -25,9 +25,35 @@ let
             time.sleep(0.05)
     sys.stdout.flush()
   '';
+  # M2: a test CA and a leaf for the stores' TLS name, and another self-signed certificate a
+  # `ca_file` can be pinned to by mistake. Test-only values, no deployment data.
+  certs = pkgs.runCommand "hikyaku-test-certs" { nativeBuildInputs = [ pkgs.openssl ]; } ''
+    mkdir $out && cd $out
+    openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -subj /CN=hikyaku-test-ca \
+      -keyout ca.key -out ca.pem
+    openssl req -newkey rsa:2048 -nodes -subj /CN=store.example.org -keyout leaf.key -out leaf.csr
+    openssl x509 -req -in leaf.csr -CA ca.pem -CAkey ca.key -CAcreateserial -days 3650 \
+      -extfile <(printf 'subjectAltName=DNS:store.example.org,IP:127.0.0.1') -out leaf.pem
+    openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -subj /CN=other \
+      -keyout other.key -out other.pem
+  '';
+  tokens = {
+    nodeA = "test-token-node-a";
+    nodeB = "test-token-node-b";
+    reader = "test-token-reader";
+    unknown = "test-token-unknown";
+  };
+  tokenFile = name: "${pkgs.writeText "token-${name}" tokens.${name}}";
+  sha256 = builtins.hashString "sha256";
+  mib = 1024 * 1024;
 in
-{
-  inherit gen;
+rec {
+  inherit
+    pkgs
+    gen
+    certs
+    tokenFile
+    ;
   validateLogs = inputs.nisshi.lib.validateLogs.${system};
   validateMetrics = inputs.masu.lib.validateMetrics.${system};
 
@@ -160,6 +186,184 @@ in
         RateLimitIntervalSec=0
       '';
     };
+
+  # M2: the store VM, masu and nisshi through their own modules (TLS through LoadCredential,
+  # tokens as hashes, metrics listeners set explicitly: their default is off). masu 9472, nisshi
+  # 9473 on every address; their /metrics on loopback 9475 and 9474.
+  store = {
+    imports = [
+      inputs.masu.nixosModules.default
+      inputs.nisshi.nixosModules.default
+    ];
+    services =
+      let
+        common = {
+          enable = true;
+          tls = {
+            certFile = "${certs}/leaf.pem";
+            keyFile = "${certs}/leaf.key";
+          };
+          tokens = {
+            ${sha256 tokens.nodeA} = "node:node-a";
+            ${sha256 tokens.nodeB} = "node:node-b";
+            ${sha256 tokens.reader} = "reader";
+          };
+          # The VM disk is small: the stores' 2 GiB default reserve would answer 507 forever.
+          diskReserve = 8 * mib;
+        };
+      in
+      {
+        masu = common // {
+          listen = [ "0.0.0.0:9472" ];
+          metrics.listen = "127.0.0.1:9475";
+        };
+        nisshi = common // {
+          listen = [ "0.0.0.0:9473" ];
+          metrics.listen = "127.0.0.1:9474";
+        };
+      };
+    # Test node only: the scenarios stop and start the stores more than StartLimitBurst allows.
+    systemd.services.masu.startLimitIntervalSec = 0;
+    systemd.services.nisshi.startLimitIntervalSec = 0;
+    networking.firewall.allowedTCPPorts = [
+      9472
+      9473
+    ];
+    virtualisation.memorySize = 2048;
+    virtualisation.diskSize = 4096;
+    environment.systemPackages = [
+      pkgs.zstd
+      pkgs.jq
+      pkgs.curl
+    ];
+  };
+
+  # M2: the agent VM of `machine` with both destinations on the store VM: an IP literal and
+  # `server_name` (ADR 0005, 0006), the pinned test CA, the node's token; the agent scrapes its
+  # own /metrics every second (ADR 0008's time scaling).
+  agent =
+    {
+      spoolLimit ? 1073741824,
+      token ? "nodeA",
+      masuPort ? 9472,
+      nisshiPort ? 9473,
+    }:
+    { nodes, ... }:
+    let
+      destination = port: {
+        url = "https://${nodes.store.networking.primaryIPAddress}:${toString port}";
+        serverName = "store.example.org";
+        caFile = "${certs}/ca.pem";
+        tokenFile = tokenFile token;
+      };
+    in
+    {
+      imports = [ (machine { inherit spoolLimit; }) ];
+      services.hikyaku = {
+        targets.hikyaku = {
+          url = "http://127.0.0.1:9471/metrics";
+          interval = "1s";
+        };
+        masu = destination masuPort;
+        nisshi = destination nisshiPort;
+      };
+      # Test node only: kill -9 loops and configuration switches restart it often.
+      systemd.services.hikyaku.startLimitIntervalSec = 0;
+    };
+
+  # Python helpers of the M2 scripts: `machine` is the agent VM, `store` the store VM.
+  deliveryPrelude = ''
+    NISSHI = "zstdcat /var/lib/nisshi/node-a/*.ndjson.zst 2>/dev/null"
+    MASU = "zstdcat /var/lib/masu/archive/node-a/*.ndjson.zst 2>/dev/null"
+    ZEROS = "0" * 32
+    UNIQUE = 'map(.stream + ":" + (.seq | tostring)) | length == (unique | length)'
+    # The agent's streams hold seq 1..max exactly (nisshi's own seq-gap records excluded).
+    DENSE = f'map(select(.stream != "{ZEROS}")) | group_by(.stream) | all(map(.seq) | sort == [range(1; length + 1)])'
+
+
+    def stored(cmd, jq):
+        return store.succeed(f"{cmd} | jq -s -c '{jq}'").strip()
+
+
+    def status(port):
+        return json.loads(store.succeed(
+            "curl -sS --cacert ${certs}/ca.pem"
+            f" --resolve store.example.org:{port}:127.0.0.1"
+            " -H 'Authorization: Bearer ${tokens.reader}'"
+            f" https://store.example.org:{port}/v1/status"
+        ))
+
+
+    def metric(text, sample):
+        for line in text.splitlines():
+            if line.startswith(sample + " "):
+                return float(line.split()[-1])
+        return 0.0
+
+
+    def agent_metric(sample):
+        return metric(machine.succeed("curl -s http://127.0.0.1:9471/metrics"), sample)
+
+
+    def store_pushes(port):
+        # Every push request a store answered, whatever the code.
+        text = store.succeed(f"curl -s http://127.0.0.1:{port}/metrics")
+        return sum(float(l.split()[-1]) for l in text.splitlines() if "_push_requests_total{" in l)
+
+
+    def stream_of(signal):
+        return machine.succeed(f"jq -r .streams.{signal}.stream /var/lib/hikyaku/state.json").strip()
+
+
+    def diagnose_delivery():
+        print("=== diagnose delivery ===")
+        sh(f"{OWN} | grep -v '\"event\":\"heartbeat\"' | tail -n 40")
+        sh("curl -s http://127.0.0.1:9471/metrics | grep -v '^#'")
+        sh("cat /var/lib/hikyaku/state.json | jq -c '.streams, .paused, (.replacements | map_values(keys))'")
+        sh("ls -la /var/lib/hikyaku/logs /var/lib/hikyaku/metrics")
+        for cmd in [f"{NISSHI} | jq -s -c 'group_by(.service) | map([.[0].service, length])'",
+                    f"{MASU} | jq -s -c 'group_by(.service) | map([.[0].service, length])'",
+                    "journalctl -u masu -u nisshi -o cat | tail -n 20",
+                    "curl -s http://127.0.0.1:9474/metrics http://127.0.0.1:9475/metrics | grep push_requests"]:
+            status_, out = store.execute(cmd)
+            print(f"store$ {cmd}  [exit {status_}]\n{out.rstrip()}")
+        print("=== end diagnose delivery ===")
+
+
+    def wait_stored(services, n, timeout=900):
+        try:
+            store.wait_until_succeeds(
+                f"{NISSHI} | jq -s 'map(select(.service | IN({services})) | .n) | length >= {n}' | grep -qx true",
+                timeout=timeout,
+            )
+        except Exception:
+            diagnose_delivery()
+            raise
+
+
+    def check_stores(services, n):
+        checks = {
+            "nisshi: n exactly 1..N": stored(NISSHI, f"map(select(.service | IN({services})) | .n) | sort == [range(1; {n} + 1)]"),
+            "nisshi: (stream, seq) unique": stored(NISSHI, UNIQUE),
+            "nisshi: agent stream dense": stored(NISSHI, DENSE),
+            "nisshi: no journal-gap": stored(NISSHI, 'map(.event) | index("journal-gap") == null'),
+            "masu: (stream, seq) unique": stored(MASU, UNIQUE),
+            "masu: agent stream dense": stored(MASU, DENSE),
+        }
+        failed = [k for k, v in checks.items() if v != "true"]
+        if failed:
+            diagnose_delivery()
+        assert not failed, failed
+
+
+    def check_own_output():
+        # The agent's journal is nisshi's schema, its /metrics masu's convention (TLS and
+        # push errors included).
+        machine.succeed(f"{OWN} | ${inputs.nisshi.lib.validateLogs.${system}} validate --logs")
+        machine.succeed("${
+          inputs.masu.lib.validateMetrics.${system}
+        } validate --metrics http://127.0.0.1:9471/metrics")
+  '';
 
   mkTest =
     name: test:

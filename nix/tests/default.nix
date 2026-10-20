@@ -1,5 +1,6 @@
-# The nixosTests of M1 (docs/milestones.md), one per natural group so a failure is localised;
-# the orchestrator runs them as `checks.<linux-system>.<name>`.
+# The nixosTests of M1 and M2 (docs/milestones.md), one per natural group so a failure is
+# localised; the orchestrator runs them as `checks.<linux-system>.<name>`. M2 tests run two
+# VMs: `machine` (the agent) and `store` (masu and nisshi from the flake inputs).
 {
   pkgs,
   lib,
@@ -17,4 +18,10 @@ in
   spool-format = test ./spool-format.nix;
   impermanence = test ./impermanence.nix;
   scrapes = test ./scrapes.nix;
+  # M2
+  outage = test ./outage.nix;
+  kill-nine-push = test ./kill-nine-push.nix;
+  spool-full-push = test ./spool-full-push.nix;
+  auth = test ./auth.nix;
+  rejected = test ./rejected.nix;
 }

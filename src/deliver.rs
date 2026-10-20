@@ -222,13 +222,15 @@ impl<'a> Sender<'a> {
         drop(spool);
         let stream_id = hex(&stream);
         let version = env!("CARGO_PKG_VERSION").to_string();
+        // The request takes the records and gives them back once encoded: a refusal needs
+        // the refused bytes, and a 4 MiB batch is not copied.
         macro_rules! request {
-            ($m:ident, $records:expr) => {
-                $m::PushRequest {
+            ($m:ident) => {{
+                let req = $m::PushRequest {
                     node,
                     stream_id,
                     first_seq: first,
-                    records: $records,
+                    records,
                     status: Some($m::AgentStatus {
                         version,
                         spool_bytes: snap.total(),
@@ -236,17 +238,17 @@ impl<'a> Sender<'a> {
                         paused,
                         oldest_unacked_ns: oldest,
                     }),
-                }
-                .encode_to_vec()
-            };
+                };
+                (req.encode_to_vec(), req.records)
+            }};
         }
-        let n = records.len() as u64;
-        // The records are kept beside the request: a refusal needs the refused bytes.
-        let pb = match self.signal {
-            Signal::Logs => request!(nisshi_v1, records.clone()),
-            Signal::Metrics => request!(masu_v1, records.clone()),
+        let (pb, records) = match self.signal {
+            Signal::Logs => request!(nisshi_v1),
+            Signal::Metrics => request!(masu_v1),
         };
+        let n = records.len() as u64;
         let body = zstd::bulk::compress(&pb, ZSTD_LEVEL)?;
+        drop(pb);
         Ok(Some(Batch {
             first,
             records,

@@ -769,7 +769,11 @@ mod tests {
         let two = spool.read(Signal::Logs, 1, 1 << 20, 2).unwrap();
         assert_eq!(two.iter().map(seq).collect::<Vec<_>>(), [1, 2]);
         let one = spool.read(Signal::Logs, 1, 1, 100).unwrap();
-        assert_eq!(one.len(), 1, "at least one record, never more than max_bytes");
+        assert_eq!(
+            one.len(),
+            1,
+            "at least one record, never more than max_bytes"
+        );
         spool
             .set_replacement(Signal::Logs, 3, "{\"r\":3}".into())
             .unwrap();
@@ -791,7 +795,12 @@ mod tests {
         drop(spool);
         let (spool, _) = Spool::open(&tmp, "node-a", 1 << 30).unwrap();
         assert_eq!(spool.snapshot().bytes[0], 0);
-        assert!(spool.read(Signal::Logs, 5, 1 << 20, 100).unwrap().is_empty());
+        assert!(
+            spool
+                .read(Signal::Logs, 5, 1 << 20, 100)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
