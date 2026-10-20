@@ -172,6 +172,56 @@ impl Scrape {
     }
 }
 
+/// `ts` and `service` of a refused record when readable and valid, else the agent's time and
+/// `hikyaku` (ADR 0005, nisshi log-schema.md "Events of the stack itself").
+fn refused_origin(refused: &[u8]) -> (String, String) {
+    let v: Value = serde_json::from_slice(refused).unwrap_or(Value::Null);
+    let ts = v["ts"]
+        .as_str()
+        .filter(|s| crate::ts::is_timestamp(s))
+        .map_or_else(crate::ts::now, str::to_string);
+    let service = v["service"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("hikyaku")
+        .to_string();
+    (ts, service)
+}
+
+/// The record sent in place of a log record nisshi refused: `rejected`, same `seq`.
+pub fn rejected_log(refused: &[u8], reason: &str, node: &str, stream: &str, seq: u64) -> String {
+    let (ts, service) = refused_origin(refused);
+    PendingLog {
+        line: service_line(
+            &ts,
+            "error",
+            "rejected",
+            &[("err", reason.into()), ("raw_b64", base64(refused).into())],
+        ),
+        service,
+        source: None,
+    }
+    .render(node, stream, seq)
+}
+
+/// The record sent in place of a scrape record masu refused: `up:false`,
+/// `error:"rejected:<reason>"`, `raw_b64`, same `seq`.
+pub fn rejected_scrape(refused: &[u8], reason: &str, node: &str, stream: &str, seq: u64) -> String {
+    let (ts, service) = refused_origin(refused);
+    let mut out = Scrape {
+        ts,
+        service,
+        dur_us: 0,
+        result: ScrapeResult::Down {
+            error: format!("rejected:{reason}"),
+        },
+    }
+    .render(node, stream, seq);
+    out.pop();
+    out.push_str(&format!(",\"raw_b64\":\"{}\"}}", base64(refused)));
+    out
+}
+
 fn trim_ascii(b: &[u8]) -> &[u8] {
     let start = b
         .iter()
@@ -331,6 +381,49 @@ mod tests {
         let r = down.render("node-a", STREAM, 2);
         assert_eq!(scrape_record::check(r.as_bytes()), Ok(()), "{r}");
         assert!(r.contains(r#""up":false,"dur_us":812,"error":"series-limit"}"#));
+    }
+
+    #[test]
+    fn replacements_pass_the_stores_rules() {
+        let refused = br#"{"v":1,"ts":"2026-10-19T08:14:03.512004117Z","level":"info","event":"x","node":"node-a","service":"annai","stream":"9b1e0c5d7a2f4e8b9c0d1e2f3a4b5c6d","seq":7,"n":1}"#;
+        let r = rejected_log(refused, "test-refused", "node-a", STREAM, 7);
+        assert_eq!(check_record(r.as_bytes()), Ok(()), "{r}");
+        let v: Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(
+            (
+                &v["event"],
+                &v["level"],
+                &v["err"],
+                &v["service"],
+                &v["seq"]
+            ),
+            (
+                &"rejected".into(),
+                &"error".into(),
+                &"test-refused".into(),
+                &"annai".into(),
+                &7.into()
+            )
+        );
+        assert_eq!(v["ts"], "2026-10-19T08:14:03.512004117Z");
+        assert_eq!(v["raw_b64"], base64(refused));
+        // Unreadable: the agent's time and service.
+        let r = rejected_log(&[0xff, b'{'], "not-utf8", "node-a", STREAM, 8);
+        assert_eq!(check_record(r.as_bytes()), Ok(()), "{r}");
+        let v: Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["service"], "hikyaku");
+        assert!(crate::ts::is_timestamp(v["ts"].as_str().unwrap()));
+
+        let scrape = br#"{"v":1,"ts":"2026-10-19T08:14:03.512004117Z","node":"node-a","service":"annai","stream":"9b1e0c5d7a2f4e8b9c0d1e2f3a4b5c6d","seq":3,"up":true,"dur_us":1,"content_type":"text/plain","body":"a 1\n"}"#;
+        let r = rejected_scrape(scrape, "body-format", "node-a", STREAM, 3);
+        assert_eq!(scrape_record::check(r.as_bytes()), Ok(()), "{r}");
+        let v: Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["error"], "rejected:body-format");
+        assert_eq!(v["up"], false);
+        assert_eq!(v["service"], "annai");
+        assert_eq!(v["raw_b64"], base64(scrape));
+        let r = rejected_scrape(b"[1]", "not-object", "node-a", STREAM, 4);
+        assert_eq!(scrape_record::check(r.as_bytes()), Ok(()), "{r}");
     }
 
     #[test]

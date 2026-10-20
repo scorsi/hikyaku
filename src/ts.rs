@@ -35,6 +35,23 @@ pub fn from_unix(secs: i64, nanos: u32) -> String {
     )
 }
 
+/// Unix nanoseconds of a valid timestamp (days_from_civil, Howard Hinnant).
+pub fn to_unix_nanos(s: &str) -> Option<i64> {
+    if !is_timestamp(s) {
+        return None;
+    }
+    let n = |a: usize, b: usize| s[a..b].parse::<i64>().ok();
+    let (y, m, d) = (n(0, 4)?, n(5, 7)?, n(8, 10)?);
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    let secs = days * 86_400 + n(11, 13)? * 3600 + n(14, 16)? * 60 + n(17, 19)?;
+    Some(secs * 1_000_000_000 + n(20, 29)?)
+}
+
 /// `2026-10-19T08:14:00.000213904Z`: shape, then a real UTC date and time.
 pub fn is_timestamp(s: &str) -> bool {
     let b = s.as_bytes();
@@ -104,6 +121,19 @@ mod tests {
             "2026-10-19T08:14:03.512004000Z"
         );
         assert!(is_timestamp(&now()));
+        assert_eq!(
+            to_unix_nanos("2026-10-19T08:14:03.512004117Z"),
+            Some(1_792_397_643_512_004_117)
+        );
+        assert_eq!(to_unix_nanos("1970-01-01T00:00:00.000000000Z"), Some(0));
+        assert_eq!(
+            to_unix_nanos("2028-02-29T23:59:59.999999999Z").map(|n| from_unix(
+                n.div_euclid(1_000_000_000),
+                n.rem_euclid(1_000_000_000) as u32
+            )),
+            Some("2028-02-29T23:59:59.999999999Z".to_string())
+        );
+        assert_eq!(to_unix_nanos("x"), None);
         assert!(is_timestamp("2028-02-29T23:59:59.999999999Z"));
         for bad in [
             "2026-10-19T08:14:00.000213Z",

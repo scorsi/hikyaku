@@ -231,6 +231,11 @@ impl Spool {
             if name.ends_with(".tmp") {
                 fs::remove_file(entry.path())?;
             } else if let Some(range) = segment_range(&name) {
+                // A crash between the ack's state write and the deletion leaves it behind.
+                if range.1 <= self.state.stream(s).acked_seq {
+                    fs::remove_file(entry.path())?;
+                    continue;
+                }
                 closed_bytes += entry.metadata()?.len();
                 segments.push(range);
             }
@@ -391,6 +396,84 @@ impl Spool {
         self.write_state()
     }
 
+    /// Up to `max_records` spooled records from `from` on, in seq order, stopping before
+    /// `max_bytes` is crossed (at least one record). The bytes as spooled, without newline;
+    /// replacements are applied by the sender.
+    pub fn read(
+        &self,
+        s: Signal,
+        from: u64,
+        max_bytes: usize,
+        max_records: usize,
+    ) -> io::Result<Vec<Vec<u8>>> {
+        let dir = self.dir.join(s.name());
+        let mut segments: Vec<(u64, u64)> = fs::read_dir(&dir)?
+            .filter_map(|e| segment_range(&e.ok()?.file_name().to_string_lossy()))
+            .filter(|&(_, b)| b >= from)
+            .collect();
+        segments.sort();
+        let mut batch = Batch {
+            from,
+            max_bytes,
+            max_records,
+            out: Vec::new(),
+            bytes: 0,
+        };
+        for (a, b) in segments {
+            let name = format!("{a:020}-{b:020}.ndjson.zst");
+            let mut reader = BufReader::new(zstd::Decoder::new(File::open(dir.join(name))?)?);
+            if !batch.take(a, &mut reader)? {
+                return Ok(batch.out);
+            }
+        }
+        let open = File::open(dir.join("open.ndjson"))?;
+        let mut reader = BufReader::new(open.take(self.state.stream(s).open_bytes));
+        batch.take(self.open_first_seq[s.i()], &mut reader)?;
+        Ok(batch.out)
+    }
+
+    /// The store committed everything up to `acked`: the state first, then closed segments
+    /// fully acked are deleted and replacements up to `acked` dropped (ADR 0005, spool.md).
+    pub fn ack(&mut self, s: Signal, acked: u64) -> io::Result<Vec<(Signal, bool)>> {
+        if acked <= self.state.stream(s).acked_seq {
+            return Ok(Vec::new());
+        }
+        self.state.stream_mut(s).acked_seq = acked;
+        if let Some(r) = self.state.replacements.get_mut(s.name()) {
+            r.retain(|seq, _| seq.parse::<u64>().is_ok_and(|n| n > acked));
+        }
+        self.write_state()?;
+        let dir = self.dir.join(s.name());
+        for entry in fs::read_dir(&dir)? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if segment_range(&name).is_some_and(|(_, b)| b <= acked) {
+                let len = entry.metadata()?.len();
+                fs::remove_file(entry.path())?;
+                self.closed_bytes[s.i()] -= len.min(self.closed_bytes[s.i()]);
+            }
+        }
+        let transitions = self.evaluate_pause();
+        if !transitions.is_empty() {
+            self.write_state()?;
+        }
+        Ok(transitions)
+    }
+
+    /// The record sent in place of the spooled one at `seq`, committed before the resend.
+    pub fn replacement(&self, s: Signal, seq: u64) -> Option<&String> {
+        self.state.replacements.get(s.name())?.get(&seq.to_string())
+    }
+
+    pub fn set_replacement(&mut self, s: Signal, seq: u64, record: String) -> io::Result<()> {
+        self.state
+            .replacements
+            .entry(s.name().into())
+            .or_default()
+            .insert(seq.to_string(), record);
+        self.write_state()
+    }
+
     /// Pause at 99 % of the limit (the last 1 % is for the agent's own events), resume below
     /// 90 %. The limit is shared, so both signals flip together.
     fn evaluate_pause(&mut self) -> Vec<(Signal, bool)> {
@@ -420,6 +503,42 @@ impl Spool {
         f.sync_all()?;
         fs::rename(&tmp, self.dir.join("state.json"))?;
         File::open(&self.dir)?.sync_all()
+    }
+}
+
+/// What `Spool::read` collects.
+struct Batch {
+    from: u64,
+    max_bytes: usize,
+    max_records: usize,
+    out: Vec<Vec<u8>>,
+    bytes: usize,
+}
+
+impl Batch {
+    /// Lines of one segment whose first line has seq `first`; false once the batch is full.
+    fn take(&mut self, first: u64, reader: &mut dyn BufRead) -> io::Result<bool> {
+        let mut seq = first;
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            if reader.read_until(b'\n', &mut line)? == 0 {
+                return Ok(true);
+            }
+            if seq >= self.from {
+                if line.last() == Some(&b'\n') {
+                    line.pop();
+                }
+                if self.out.len() >= self.max_records
+                    || (!self.out.is_empty() && self.bytes + line.len() > self.max_bytes)
+                {
+                    return Ok(false);
+                }
+                self.bytes += line.len();
+                self.out.push(line.clone());
+            }
+            seq += 1;
+        }
     }
 }
 
@@ -629,6 +748,50 @@ mod tests {
         let mut out = Vec::new();
         dump(&tmp, Some(Signal::Logs), 2, 3, &mut out).unwrap();
         assert_eq!(String::from_utf8(out).unwrap().lines().count(), 2);
+    }
+
+    #[test]
+    fn read_across_segments_and_ack() {
+        let tmp = tempdir("read");
+        let (mut spool, _) = Spool::open(&tmp, "node-a", 1 << 30).unwrap();
+        spool.segment_bytes = 1;
+        spool
+            .commit(Signal::Logs, &[event(1), event(2)], false, |_| {})
+            .unwrap();
+        spool.segment_bytes = SEGMENT_BYTES;
+        spool
+            .commit(Signal::Logs, &[event(3), event(4)], false, |_| {})
+            .unwrap();
+        let seq = |r: &Vec<u8>| seq_of(std::str::from_utf8(r).unwrap()).unwrap();
+        let all = spool.read(Signal::Logs, 2, 1 << 20, 100).unwrap();
+        assert_eq!(all.iter().map(seq).collect::<Vec<_>>(), [2, 3, 4]);
+        assert!(all.iter().all(|r| r.last() == Some(&b'}')));
+        let two = spool.read(Signal::Logs, 1, 1 << 20, 2).unwrap();
+        assert_eq!(two.iter().map(seq).collect::<Vec<_>>(), [1, 2]);
+        let one = spool.read(Signal::Logs, 1, 1, 100).unwrap();
+        assert_eq!(one.len(), 1, "at least one record, never more than max_bytes");
+        spool
+            .set_replacement(Signal::Logs, 3, "{\"r\":3}".into())
+            .unwrap();
+        assert!(spool.ack(Signal::Logs, 2).unwrap().is_empty());
+        let seg = tmp.join("logs/00000000000000000001-00000000000000000002.ndjson.zst");
+        assert!(!seg.exists(), "fully acked closed segment deleted");
+        assert_eq!(spool.closed_bytes[0], 0);
+        assert!(spool.replacement(Signal::Logs, 3).is_some());
+        spool.ack(Signal::Logs, 3).unwrap();
+        assert!(spool.replacement(Signal::Logs, 3).is_none());
+        assert_eq!(seqs(&dumped(&tmp, Signal::Logs)), [3, 4]);
+        drop(spool);
+        // A crash between the ack's state write and the deletion: deleted at start.
+        let (mut spool, _) = Spool::open(&tmp, "node-a", 1 << 30).unwrap();
+        assert_eq!(spool.state.stream(Signal::Logs).acked_seq, 3);
+        spool.close(Signal::Logs).unwrap();
+        spool.state.stream_mut(Signal::Logs).acked_seq = 4;
+        spool.write_state().unwrap();
+        drop(spool);
+        let (spool, _) = Spool::open(&tmp, "node-a", 1 << 30).unwrap();
+        assert_eq!(spool.snapshot().bytes[0], 0);
+        assert!(spool.read(Signal::Logs, 5, 1 << 20, 100).unwrap().is_empty());
     }
 
     #[test]
