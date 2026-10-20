@@ -151,8 +151,9 @@ in
       # console, synchronously: journald then stores ~100 lines/s and lags the generators by
       # minutes. A drop-in overrides journald.conf; failures (notice and above) stay visible.
       # No default rate limit: a generator must reach the journal whole (exactly-once checks).
-      # A unit's LogRateLimitIntervalSec=0 means "journald's default", not "off"; a unit that
-      # must be limited (journald-suppressed's flood) sets its own non-zero limit.
+      # A unit's LogRateLimitIntervalSec=0 means "journald's default", not "off". With the
+      # global limit off, a unit's own non-zero limit did not apply in the VM: journald-suppressed
+      # restores the defaults in its node.
       environment.etc."systemd/journald.conf.d/console.conf".text = ''
         [Journal]
         MaxLevelConsole=notice

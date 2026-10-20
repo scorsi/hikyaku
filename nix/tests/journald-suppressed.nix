@@ -4,6 +4,14 @@ common:
 common.mkTest "journald-suppressed" {
   nodes.machine = {
     imports = [ (common.machine { }) ];
+    # common.nix turns journald's global rate limit off for the exact-count tests; with it off
+    # the flood's own LogRateLimit* did not limit in the VM (no "Suppressed" line). Restore
+    # journald's defaults here; this drop-in sorts after console.conf, so it wins.
+    environment.etc."systemd/journald.conf.d/rate-limit.conf".text = ''
+      [Journal]
+      RateLimitIntervalSec=30s
+      RateLimitBurst=10000
+    '';
     systemd.services.flood = {
       path = [ common.gen ];
       serviceConfig = {
