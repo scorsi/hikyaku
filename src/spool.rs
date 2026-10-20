@@ -278,6 +278,18 @@ impl Spool {
         snap
     }
 
+    /// Bytes ingestion may still add before it pauses (99 % of the limit). Sources size their
+    /// batches against it, so a batch overshoots by at most one record and the last 1 % stays
+    /// for own events and `skipped-spool-full` records (ADR 0004).
+    pub fn room(&self) -> u64 {
+        (self.limit - self.limit / 100).saturating_sub(self.snapshot().total())
+    }
+
+    /// The bytes `p` takes in the spool once rendered (agent fields and newline included).
+    pub fn estimate(&self, p: &PendingLog) -> u64 {
+        p.render(&self.node, &"0".repeat(32), u64::MAX).len() as u64 + 1
+    }
+
     /// Appends the records (validated, `seq` assigned), fsyncs, then commits the state with
     /// `positions` applied (cursor, file offsets). `reserve` is for the agent's own events: they
     /// may use the last 1 % of the limit, but nothing beyond it.
@@ -651,6 +663,79 @@ mod tests {
         let (spool, tr) = Spool::open(&tmp, "node-a", 1 << 20).unwrap();
         assert_eq!(tr, [(Signal::Logs, false), (Signal::Metrics, false)]);
         assert!(!spool.is_paused(Signal::Logs));
+    }
+
+    fn skipped() -> Pending {
+        Pending::Scrape(Scrape {
+            ts: crate::ts::now(),
+            service: "hikyaku".into(),
+            dur_us: 0,
+            result: ScrapeResult::Down {
+                error: "skipped-spool-full".into(),
+            },
+        })
+    }
+
+    fn line(n: u64) -> PendingLog {
+        let raw = format!(
+            "{{\"v\":1,\"ts\":\"2026-10-20T08:00:00.000000000Z\",\"level\":\"info\",\"event\":\"tick\",\"n\":{n},\"pad\":\"{}\"}}",
+            "x".repeat(100)
+        );
+        PendingLog::from_source(raw.as_bytes(), "", "info", "gen1", "journald")
+    }
+
+    // The spool-full nixosTest: one journald batch crossed the limit, the reserve was gone and
+    // the `skipped-spool-full` record (and the `spool-full` event) never reached the spool.
+    #[test]
+    fn batches_sized_by_room_keep_the_reserve() {
+        let tmp = tempdir("room");
+        let (mut spool, _) = Spool::open(&tmp, "node-a", 2 << 20).unwrap();
+        let unbounded: Vec<Pending> = (0..10_000).map(|n| Pending::Log(line(n))).collect();
+        spool
+            .commit(Signal::Logs, &unbounded, false, |_| {})
+            .unwrap();
+        assert!(spool.is_paused(Signal::Metrics) && spool.snapshot().total() > spool.limit);
+        let c = spool
+            .commit(Signal::Metrics, &[skipped()], true, |_| {})
+            .unwrap();
+        assert_eq!(c.count, 0, "an overshooting batch leaves no reserve");
+
+        // What the sources do: close the batch once its estimate reaches the room.
+        let tmp = tempdir("room-bounded");
+        let (mut spool, _) = Spool::open(&tmp, "node-a", 2 << 20).unwrap();
+        let mut n = 0;
+        while !spool.is_paused(Signal::Logs) {
+            let room = spool.room();
+            let (mut batch, mut bytes) = (Vec::new(), 0);
+            while bytes < room && batch.len() < 1000 {
+                let p = line(n);
+                n += 1;
+                let rendered = p.render("node-a", &"0".repeat(32), n).len() as u64 + 1;
+                assert!(spool.estimate(&p) >= rendered);
+                bytes += spool.estimate(&p);
+                batch.push(Pending::Log(p));
+            }
+            spool.commit(Signal::Logs, &batch, false, |_| {}).unwrap();
+        }
+        let one = spool.estimate(&line(0));
+        assert!(spool.snapshot().total() <= spool.limit - spool.limit / 100 + one);
+        assert_eq!(spool.room(), 0);
+        let c = spool
+            .commit(Signal::Metrics, &[skipped()], true, |_| {})
+            .unwrap();
+        assert_eq!(c.count, 1);
+        let ev = Pending::Log(PendingLog::event("warn", "spool-full", &[]));
+        assert_eq!(
+            spool
+                .commit(Signal::Logs, &[ev], true, |_| {})
+                .unwrap()
+                .count,
+            1
+        );
+        assert_eq!(
+            dumped(&tmp, Signal::Metrics)[0]["error"],
+            "skipped-spool-full"
+        );
     }
 
     #[test]

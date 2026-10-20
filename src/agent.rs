@@ -209,16 +209,19 @@ fn journald_loop(agent: &Agent) {
         // journald rotated past the cursor while the agent was paused or stopped.
         let mut first = cursor.is_some();
         let mut batch: Vec<Pending> = Vec::new();
+        let mut batch_bytes = 0;
         let mut last_cursor: Option<String> = None;
         loop {
             while agent.spool.lock().unwrap().is_paused(Signal::Logs) {
                 thread::sleep(Duration::from_secs(1));
             }
+            let room = agent.spool.lock().unwrap().room();
             let entry = match rx.recv_timeout(BATCH_WAIT) {
                 Ok(e) => Some(e),
                 Err(RecvTimeoutError::Timeout) => None,
                 Err(RecvTimeoutError::Disconnected) => break,
             };
+            let pushed = batch.len();
             if let Some(e) = entry.as_ref() {
                 if std::mem::take(&mut first) {
                     if Some(&e.cursor) == cursor.as_ref() {
@@ -256,10 +259,14 @@ fn journald_loop(agent: &Agent) {
                 }
                 last_cursor = Some(e.cursor.clone());
             }
-            if last_cursor.is_some() && (entry.is_none() || batch.len() >= BATCH) {
+            batch_bytes += estimate(agent, &batch[pushed..]);
+            if last_cursor.is_some()
+                && (entry.is_none() || batch.len() >= BATCH || batch_bytes >= room)
+            {
                 let cursor = last_cursor.take();
                 agent.commit(Signal::Logs, &batch, |st| st.journal_cursor = cursor);
                 batch.clear();
+                batch_bytes = 0;
             }
         }
         let _ = child.kill();
@@ -268,6 +275,18 @@ fn journald_loop(agent: &Agent) {
         agent.event("error", "journald-exited", &[]);
         thread::sleep(RETRY);
     }
+}
+
+/// The spool bytes of `items` once rendered: sources compare it with `Spool::room`.
+fn estimate(agent: &Agent, items: &[Pending]) -> u64 {
+    let spool = agent.spool.lock().unwrap();
+    items
+        .iter()
+        .map(|p| match p {
+            Pending::Log(l) => spool.estimate(l),
+            Pending::Scrape(_) => 0,
+        })
+        .sum()
 }
 
 /// An own event that travels inside a source batch (so it keeps its place in the stream).
@@ -315,12 +334,25 @@ fn file_loop(agent: &Agent, name: &str, path: std::path::PathBuf) {
             ));
         }
         let now = ts::now();
+        let room = agent.spool.lock().unwrap().room();
+        let mut bytes = estimate(agent, &batch);
+        let mut taken = 0;
         for line in &polled.lines {
-            batch.push(Pending::Log(PendingLog::from_source(
-                line, &now, "info", name, "file",
-            )));
+            if bytes >= room {
+                break;
+            }
+            let p = PendingLog::from_source(line, &now, "info", name, "file");
+            bytes += agent.spool.lock().unwrap().estimate(&p);
+            batch.push(Pending::Log(p));
+            taken += 1;
         }
-        let full = polled.lines.len() >= BATCH;
+        // Lines beyond the room are read again after the pause (their offset is not saved).
+        let rest: u64 = polled.lines[taken..]
+            .iter()
+            .map(|l| l.len() as u64 + 1)
+            .sum();
+        tail.offset -= rest;
+        let full = polled.lines.len() >= BATCH || rest > 0;
         if !batch.is_empty() {
             let pos = FilePos {
                 path: path.to_string_lossy().into_owned(),
