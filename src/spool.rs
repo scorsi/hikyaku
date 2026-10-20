@@ -433,7 +433,8 @@ impl Spool {
     }
 
     /// The store committed everything up to `acked`: the state first, then closed segments
-    /// fully acked are deleted and replacements up to `acked` dropped (ADR 0005, spool.md).
+    /// fully acked are deleted, a fully acked open segment is emptied (ADR 0012) and
+    /// replacements up to `acked` dropped (ADR 0005, spool.md).
     pub fn ack(&mut self, s: Signal, acked: u64) -> io::Result<Vec<(Signal, bool)>> {
         if acked <= self.state.stream(s).acked_seq {
             return Ok(Vec::new());
@@ -453,8 +454,20 @@ impl Spool {
                 self.closed_bytes[s.i()] -= len.min(self.closed_bytes[s.i()]);
             }
         }
+        // Closing it would give a closed segment deleted at once: empty it in place instead.
+        // A crash before the state write is recovered by the truncation to `open_bytes`.
+        let st = self.state.stream(s);
+        let emptied = st.open_bytes > 0 && acked + 1 >= st.next_seq;
+        if emptied {
+            let next_seq = st.next_seq;
+            self.open[s.i()].set_len(0)?;
+            self.open[s.i()].sync_all()?;
+            self.state.stream_mut(s).open_bytes = 0;
+            self.open_first_seq[s.i()] = next_seq;
+            self.open_since[s.i()] = Instant::now();
+        }
         let transitions = self.evaluate_pause();
-        if !transitions.is_empty() {
+        if emptied || !transitions.is_empty() {
             self.write_state()?;
         }
         Ok(transitions)
@@ -835,6 +848,49 @@ mod tests {
         let (spool, tr) = Spool::open(&tmp, "node-a", 1 << 20).unwrap();
         assert_eq!(tr, [(Signal::Logs, false), (Signal::Metrics, false)]);
         assert!(!spool.is_paused(Signal::Logs));
+    }
+
+    #[test]
+    fn fully_acked_open_segment_is_emptied_and_resumes() {
+        let tmp = tempdir("ack-open");
+        let (mut spool, _) = Spool::open(&tmp, "node-a", 100_000).unwrap();
+        let mut n = 0;
+        while !spool.is_paused(Signal::Logs) {
+            n += 1;
+            spool
+                .commit(Signal::Logs, &[event(n)], false, |_| {})
+                .unwrap();
+        }
+        let open = tmp.join("logs/open.ndjson");
+        // Partly acked: the open segment keeps every byte, still paused.
+        assert!(spool.ack(Signal::Logs, n - 1).unwrap().is_empty());
+        assert!(spool.state.stream(Signal::Logs).open_bytes > 0);
+        // Fully acked: emptied at once, ingestion resumes without waiting for the close.
+        assert_eq!(
+            spool.ack(Signal::Logs, n).unwrap(),
+            [(Signal::Logs, false), (Signal::Metrics, false)]
+        );
+        assert_eq!(spool.snapshot().total(), 0);
+        assert_eq!(fs::metadata(&open).unwrap().len(), 0);
+        assert!(
+            fs::read_dir(tmp.join("logs")).unwrap().count() == 1,
+            "no segment written"
+        );
+        // The next record goes on in the same stream, readable from the open segment.
+        let c = spool
+            .commit(Signal::Logs, &[event(n + 1)], false, |_| {})
+            .unwrap();
+        assert_eq!(c.first_seq, n + 1);
+        assert_eq!(seqs(&dumped(&tmp, Signal::Logs)), [n + 1]);
+        assert_eq!(
+            spool.read(Signal::Logs, n + 1, 1 << 20, 10).unwrap().len(),
+            1
+        );
+        drop(spool);
+        let (spool, tr) = Spool::open(&tmp, "node-a", 100_000).unwrap();
+        assert!(tr.is_empty() && !spool.is_paused(Signal::Logs));
+        assert_eq!(spool.state.stream(Signal::Logs).acked_seq, n);
+        assert_eq!(seqs(&dumped(&tmp, Signal::Logs)), [n + 1]);
     }
 
     fn skipped() -> Pending {

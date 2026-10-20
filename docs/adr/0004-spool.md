@@ -32,6 +32,8 @@ Full-spool policies:
   source positions; a record is acknowledged to its source (cursor advanced) only once
   committed, and leaves the spool only once the store acked it. Restart = exactly once into
   the spool.
+  Amended by [ADR 0012](0012-empty-acked-open-segment.md): a fully acked open segment is
+  emptied at once, not kept until it closes.
 - `spoolLimit` (bytes, both signals together) is required in the modules, no default.
 - **When the spool reaches the limit: pause ingestion, keep everything already spooled.**
   - logs: stop reading journald (the cursor stays). If journald rotates past the cursor before

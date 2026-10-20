@@ -25,7 +25,8 @@ Compression of closed segments (whole file, zstd ≈ level 7): **40× for scrape
 | public edge VPS | 330 MB | ≈ 10 MB | 32 MiB | 1 GiB | ≈ 95 days |
 | macOS workstation | 170 MB | ≈ 5 MB | 32 MiB | 1 GiB | months |
 
-While connected the spool holds seconds of data plus the open segments.
+While connected the spool holds seconds of data: an open segment is emptied once fully acked
+(ADR 0012).
 
 ## Memory and CPU
 

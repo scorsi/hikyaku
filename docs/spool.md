@@ -56,5 +56,6 @@ prints the spooled record and, after it, the replacement marked with `"_replaced
 
 ## Deletion
 
-A closed segment whose `last_seq <= acked_seq` is deleted. The open segment is never
-deleted.
+A closed segment whose `last_seq <= acked_seq` is deleted. An open segment whose records are
+all acked (`acked_seq + 1 >= next_seq`) is emptied in place, then `open_bytes: 0` is
+committed (ADR 0012); a crash in between is the ordinary truncation to `open_bytes` at start.
