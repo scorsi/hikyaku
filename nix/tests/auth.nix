@@ -33,7 +33,8 @@ common.mkTest "auth" {
 
     def switch(name):
         starts = len(own_events("agent-start"))
-        machine.succeed(f"/run/current-system/specialisation/{name}/bin/switch-to-configuration test")
+        # After a switch, /run/current-system is the specialisation, which has none of its own.
+        machine.succeed(f"/run/booted-system/specialisation/{name}/bin/switch-to-configuration test")
         machine.wait_until_succeeds(f"test $({OWN} | grep -c '\"event\":\"agent-start\"') -gt {starts}")
 
 

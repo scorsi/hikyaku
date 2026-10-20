@@ -260,6 +260,9 @@ rec {
     {
       imports = [ (machine { inherit spoolLimit; }) ];
       services.hikyaku = {
+        # The stores map the tokens to `node:node-a` / `node:node-b`; the default would be the
+        # VM's host name `machine` (every push 400 node-mismatch).
+        node = "node-a";
         targets.hikyaku = {
           url = "http://127.0.0.1:9471/metrics";
           interval = "1s";
