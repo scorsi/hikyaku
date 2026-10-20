@@ -55,7 +55,8 @@ common.mkTest "auth" {
             machine.wait_until_succeeds(
                 f"curl -s http://127.0.0.1:9471/metrics | grep -qx 'hikyaku_push_requests_total{{signal=\"{signal}\",code=\"401\"}} 1'"
             )
-        assert all(e["level"] == "error" and e["code"] == "401" for e in errors("http-401")), errors("http-401")
+        e401 = errors("http-401")
+        assert e401 and all(e["level"] == "error" and e["code"] == "401" for e in e401), e401
         assert metric(store.succeed("curl -s http://127.0.0.1:9475/metrics"), 'masu_push_requests_total{code="401"}') >= 1
         assert metric(store.succeed("curl -s http://127.0.0.1:9474/metrics"), 'nisshi_push_requests_total{code="401"}') >= 1
         nothing_stored()

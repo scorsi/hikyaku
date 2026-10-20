@@ -150,6 +150,7 @@ common.mkTest "rejected" {
         guard = wait_refused("nisshi", 4)
         assert guard["seq"] == r["seq"], (r, guard)
         machine.wait_until_succeeds(f"{OWN} | grep -q '\"event\":\"replacement-rejected\"'")
+        time.sleep(1)  # the proxy logs a request once it has answered it
         stopped = len(requests("nisshi"))
         # The logs stream sends nothing meanwhile; metrics keep flowing.
         masu_before = len(requests("masu"))
