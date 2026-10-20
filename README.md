@@ -6,7 +6,8 @@
 
 *飛脚 (hikyaku): the Edo courier who carried letters from post to post, whatever the weather.*
 
-**Status:** designed (ADRs 2026-10-19), no code yet.
+**Status:** M0–M2 implemented (spool, sources, delivery with token, pinned CA and
+`server_name`); M3 (mTLS) not started.
 
 ## Role
 
@@ -33,6 +34,16 @@ Storing history (masu, nisshi), checking that nodes are alive, alerting, host me
 | reads | journald, launchd log files | log lines in nisshi's schema, or wrapped |
 | pushes to | masu | `masu.v1` ingestion API |
 | pushes to | nisshi | `nisshi.v1` ingestion API |
+
+## Testing
+
+`nix flake check` runs the unit tests and the stores' fixtures; the nixosTests are
+`checks.<linux>.<name>` (`nix/tests/default.nix`). The M2 tests run an agent VM and a store VM
+with masu and nisshi from the flake inputs. The real stores never refuse a record the agent
+builds (same rules), so `rejected` stages refusals with a test-only proxy in front of each
+store ([`nix/tests/fakestore.py`](nix/tests/fakestore.py)): it refuses records carrying the
+marker `refuse-me` as its mode file says, and forwards everything else to the real store.
+Nothing of it is in the agent.
 
 ## Conventions
 
