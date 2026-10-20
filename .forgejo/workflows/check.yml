@@ -1,0 +1,18 @@
+# Unit tests, fixtures, module checks and the nixosTests on every push: the Linux runner runs
+# everything, the macOS runner the darwin package and module (the agent also runs on macOS).
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  linux:
+    runs-on: linux
+    steps:
+      - uses: https://code.forgejo.org/actions/checkout@v4
+      - run: nix flake check --print-build-logs
+
+  macos:
+    runs-on: macos
+    steps:
+      - uses: https://code.forgejo.org/actions/checkout@v4
+      - run: nix flake check --print-build-logs
