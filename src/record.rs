@@ -36,9 +36,13 @@ impl PendingLog {
     ) -> PendingLog {
         let trimmed = trim_ascii(raw);
         let line = if trimmed.first() == Some(&b'{') {
+            // A journald MESSAGE may hold a multi-line object: valid JSON, but a record is one
+            // line (log-schema.md, `framing`), so it is wrapped rather than kept.
+            let multi_line = trimmed.iter().any(|&c| c == b'\n' || c == b'\r');
             match logschema::check_line(trimmed) {
                 // check_line guarantees UTF-8.
-                Ok(()) => String::from_utf8(trimmed.to_vec()).unwrap_or_default(),
+                Ok(()) if !multi_line => String::from_utf8(trimmed.to_vec()).unwrap_or_default(),
+                Ok(()) => wrap(ts, "warn", "unparsed", Some("framing"), raw),
                 Err(reason) => wrap(ts, "warn", "unparsed", Some(&reason), raw),
             }
         } else {
@@ -309,6 +313,16 @@ mod tests {
             "journald",
         );
         assert_eq!(valid(&reserved)["reason"], "reserved-field:node");
+
+        let multi = b"{\n\"v\":1,\"ts\":\"2026-10-19T08:14:03.512004117Z\",\"level\":\"info\",\"event\":\"x\"\n}";
+        let v = valid(&PendingLog::from_source(
+            multi, TS, "info", "svc", "journald",
+        ));
+        assert_eq!(
+            (&v["event"], &v["reason"]),
+            (&"unparsed".into(), &"framing".into())
+        );
+        assert_eq!(v["msg"].as_str().unwrap().as_bytes(), multi);
 
         let binary = PendingLog::from_source(&[0xff, 0xfe], TS, "info", "sshd", "journald");
         assert_eq!(valid(&binary)["msg_b64"], "//4=");
