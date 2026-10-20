@@ -27,7 +27,7 @@ let
       caFile = mkOption {
         type = types.nullOr types.str;
         default = null;
-        description = "Pinned CA or self-signed certificate; null = system roots.";
+        description = "Pinned CA or self-signed certificate: only it is trusted. null = the Mozilla roots bundled in the agent (webpki-roots), not the OS store (ADR 0006).";
       };
       tokenFile = mkOption {
         type = types.str;

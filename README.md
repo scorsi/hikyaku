@@ -15,6 +15,8 @@
 - Sources: local `/metrics` endpoints (scrapes), journald on Linux, declared log files on macOS.
 - A durable spool: nothing leaves it before the store has acknowledged it.
 - Push to the stores over their ingestion APIs; it is never scraped or called from outside.
+- TLS trust per destination: `ca_file` pins one CA (only it is trusted); without it, the Mozilla
+  roots bundled in the binary (webpki-roots), not the OS store (ADR 0006).
 
 ## Not its job
 

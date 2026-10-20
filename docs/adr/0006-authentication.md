@@ -13,6 +13,11 @@ the client side of both.
 - Per destination: `token_file` (one line, the token; read through systemd
   `LoadCredential`), `ca_file` (optional: pinned CA or self-signed certificate; absent = system
   roots), `server_name` (TLS name to verify, required when the URL is an IP literal).
+- Trust (clarified 2026-10-20): without `ca_file` the agent trusts webpki-roots, the Mozilla
+  root bundle compiled into the binary by ureq's `tls` feature, not the OS certificate store.
+  This is kept on purpose: the same roots on every node and platform, no dependency on the
+  host's store. With `ca_file`, only the certificates of that file are trusted, the bundled
+  roots are not.
 - Later, `client_cert_file` and `client_key_file` (hanko SVID files, reloaded when they
   change); when set, the token is no longer sent. Switching a node is a config change.
 - The token never appears in logs, metrics, the spool or error messages.

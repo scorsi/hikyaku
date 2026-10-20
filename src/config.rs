@@ -48,6 +48,7 @@ pub struct FileInput {
 pub struct Destination {
     pub url: String,
     pub server_name: Option<String>,
+    /// Only this CA is trusted; `None` = the bundled webpki-roots (ADR 0006).
     pub ca_file: Option<PathBuf>,
     pub token_file: PathBuf,
 }
