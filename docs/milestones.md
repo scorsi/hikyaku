@@ -51,7 +51,9 @@ Needs masu M1 and nisshi M1 (ingestion APIs).
     unique in both;
   - agent `kill -9` under load while pushing: same checks;
   - spool full while the stores are down: `paused: true` in both stores' `/v1/status` once
-    they are back, `hikyaku_spool_paused 1` present in masu's stored scrapes of `hikyaku`;
+    they are back, the `error:"skipped-spool-full"` record of `hikyaku` present in masu's
+    stored scrapes (ADR 0004: no scrape runs while paused, so no stored scrape carries
+    `hikyaku_spool_paused 1`);
   - wrong token: 401, `hikyaku_push_requests_total{code="401"}` grows, nothing stored, data
     still in the spool; token of another node: 400;
   - `ca_file` pinned to another certificate: no request sent, `error` event;

@@ -1,10 +1,8 @@
 # M2: the spool fills (2 MiB) while the stores are down: once they are back, both stores'
 # /v1/status show the agent `paused: true`, masu holds the agent's `skipped-spool-full` scrape
 # record of `hikyaku` and nisshi its `spool-full` event, and every spooled line is delivered.
-#
-# Not asserted: `hikyaku_spool_paused 1` in a stored scrape of `hikyaku` (milestone M2). ADR 0004
-# pauses every scrape while the spool is full, the agent's own included, and the gauge is 0
-# again before the next scrape: no stored scrape can carry it. Proposed ADR 0009 answers it.
+# ADR 0004 pauses every scrape, the agent's own included: no stored scrape carries
+# `hikyaku_spool_paused 1` (ADR 0009, rejected; milestone M2 asks for the skipped record).
 common:
 common.mkDeliveryTest "spool-full-push" {
   nodes.machine = common.agent { spoolLimit = 2097152; };

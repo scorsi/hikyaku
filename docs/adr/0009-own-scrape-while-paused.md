@@ -1,6 +1,6 @@
 # ADR 0009 — The agent's own scrape while the spool is paused
 
-Status: proposed — 2026-10-20
+Status: Rejected — 2026-10-20 (owner: ADR 0004 kept, milestone M2 text fixed instead)
 
 ## Context
 
@@ -24,8 +24,9 @@ in both stores' `/v1/status` (`paused`, ADR 0005).
 
 ## Decision
 
-To be taken by the owner. The M2 implementation follows ADR 0004 (first option) and its
-spool-full test asserts the `skipped-spool-full` record and `paused: true`.
+Rejected by the owner on 2026-10-20: ADR 0004 stays as is (first option). The M2 milestone
+text now asks for the `skipped-spool-full` record and `paused: true`, which the code and the
+spool-full-push test already check. The agent does not scrape itself while paused.
 
 ## Consequences
 
