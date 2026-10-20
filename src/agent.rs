@@ -1,5 +1,6 @@
-//! `hikyaku run`: the sources of ADR 0003 on OS threads around one spool (ADR 0002, 0004), the
-//! agent's own events (stderr for its journal, the logs stream for the store) and `/metrics`.
+//! `hikyaku run`: the sources of ADR 0003 and the senders of ADR 0005 on OS threads around one
+//! spool (ADR 0002, 0004), the agent's own events (stderr for its journal, the logs stream for
+//! the store) and `/metrics`.
 
 use crate::config::{Config, Target};
 use crate::files::Tail;
@@ -7,7 +8,7 @@ use crate::journald::{self, Item};
 use crate::metrics::{self, Metrics};
 use crate::record::{PendingLog, Scrape, ScrapeResult};
 use crate::spool::{Commit, FilePos, Pending, Signal, Spool, State};
-use crate::{scrape, ts};
+use crate::{deliver, scrape, ts};
 use serde_json::Value;
 use std::io::{self, BufRead, BufReader};
 use std::net::TcpListener;
@@ -56,7 +57,7 @@ impl Agent {
 
     /// Announces what a commit changed. A spool I/O error is fatal: the state on disk is
     /// consistent, and systemd restarts the agent (ADR 0004: never lose data silently).
-    fn after(&self, result: io::Result<Commit>) {
+    pub fn after(&self, result: io::Result<Commit>) {
         let commit = match result {
             Ok(c) => c,
             Err(e) => {
@@ -136,6 +137,13 @@ pub fn run(cfg: Config) -> Result<(), String> {
     for (name, target) in targets {
         let a = agent.clone();
         thread::spawn(move || scrape_loop(&a, &name, &target));
+    }
+    // One sender per configured destination (ADR 0005): logs to nisshi, metrics to masu.
+    for signal in Signal::ALL {
+        if agent.cfg.destination(signal).is_some() {
+            let a = agent.clone();
+            thread::spawn(move || deliver::run(&a, signal));
+        }
     }
     notify_ready();
 

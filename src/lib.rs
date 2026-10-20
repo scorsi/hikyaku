@@ -3,6 +3,7 @@
 
 pub mod agent;
 pub mod config;
+pub mod deliver;
 pub mod files;
 pub mod journald;
 pub mod json;

@@ -94,6 +94,14 @@ impl Config {
         Ok(cfg)
     }
 
+    /// Where a signal goes (ADR 0005): logs to nisshi, metrics to masu; `None` = spooled only.
+    pub fn destination(&self, s: crate::spool::Signal) -> Option<&Destination> {
+        match s {
+            crate::spool::Signal::Logs => self.nisshi.as_ref(),
+            crate::spool::Signal::Metrics => self.masu.as_ref(),
+        }
+    }
+
     fn validate(&self) -> Result<(), String> {
         if !crate::json::is_node(&self.node) {
             return Err(format!(

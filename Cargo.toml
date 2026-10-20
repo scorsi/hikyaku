@@ -7,6 +7,9 @@ description = "Node agent of the observability stack: scrapes, logs, durable spo
 # Direct dependencies are limited to ADR 0002.
 [dependencies]
 prost = "0.13"
+# ureq's TLS backend, used directly for the pinned CA (ADR 0006); PEM parsing comes from
+# its pki-types (`rustls::pki_types::pem`), the successor of rustls-pemfile.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"

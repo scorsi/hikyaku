@@ -47,6 +47,16 @@ const FAMILIES: &[(&str, &str, &str)] = &[
         "Saved journal cursors that journald no longer had.",
     ),
     (
+        "hikyaku_push_requests_total",
+        "counter",
+        "Push requests per signal and response code.",
+    ),
+    (
+        "hikyaku_rejected_records_total",
+        "counter",
+        "Records a store refused, replaced by a rejected record, per signal and reason.",
+    ),
+    (
         "hikyaku_record_bugs_total",
         "counter",
         "Records the agent built that its own validation refused.",
@@ -111,6 +121,8 @@ impl Metrics {
                 if ![
                     "hikyaku_scrapes_total",
                     "hikyaku_journald_suppressed_lines_total",
+                    "hikyaku_push_requests_total",
+                    "hikyaku_rejected_records_total",
                 ]
                 .contains(name)
                 {
