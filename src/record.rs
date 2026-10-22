@@ -184,14 +184,16 @@ impl Scrape {
 /// `ts` and `service` of a refused record when readable and valid, else the agent's time and
 /// `hikyaku` (ADR 0005, nisshi log-schema.md "Events of the stack itself").
 fn refused_origin(refused: &[u8]) -> (String, String) {
-    let v: Value = serde_json::from_slice(refused).unwrap_or(Value::Null);
-    let ts = v["ts"]
-        .as_str()
+    let m = crate::json::parse(refused).unwrap_or(crate::json::Members(Vec::new()));
+    let ts = m
+        .get("ts")
+        .and_then(Value::as_str)
         // Valid for both stores: masu also wants it within i64 nanoseconds.
         .filter(|s| crate::ts::to_unix_nanos(s).is_some())
         .map_or_else(crate::ts::now, str::to_string);
-    let service = v["service"]
-        .as_str()
+    let service = m
+        .get("service")
+        .and_then(Value::as_str)
         .filter(|s| !s.is_empty() && s.len() <= 256)
         .unwrap_or("hikyaku")
         .to_string();
@@ -361,6 +363,24 @@ mod tests {
 
         let binary = PendingLog::from_source(&[0xff, 0xfe], TS, "info", "sshd", "journald");
         assert_eq!(valid(&binary)["msg_b64"], "//4=");
+    }
+
+    #[test]
+    fn kept_lines_stay_byte_exact() {
+        // Valid for nisshi, refused by serde_json: kept as written, seq still readable.
+        let line = br#"{"v":1,"ts":"2026-10-19T08:14:03.512004117Z","level":"info","event":"x","big":1e10000,"msg":"\ud800"}"#;
+        let p = PendingLog::from_source(line, TS, "info", "svc", "journald");
+        assert_eq!(p.line.as_bytes(), line);
+        let r = p.render("node-a", STREAM, 7);
+        assert_eq!(check_record(r.as_bytes()), Ok(()), "{r}");
+        let m = crate::json::parse(r.as_bytes()).unwrap();
+        assert_eq!(m.get("seq"), Some(&Value::from(7)));
+        let (rep, _) = rejected_log(r.as_bytes(), "x", "node-a", STREAM, 7);
+        assert!(rep.contains(r#""service":"svc""#), "{rep}");
+        // Out of the i64 nanosecond range: unparsed, with the agent's ts.
+        let late = br#"{"v":1,"ts":"2262-04-11T23:47:16.854775808Z","level":"info","event":"x"}"#;
+        let v = valid(&PendingLog::from_source(late, TS, "info", "svc", "file"));
+        assert_eq!((&v["reason"], &v["ts"]), (&"ts-format".into(), &TS.into()));
     }
 
     #[test]

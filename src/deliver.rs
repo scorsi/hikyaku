@@ -227,9 +227,9 @@ impl<'a> Sender<'a> {
         if records.is_empty() {
             return Ok(None);
         }
-        let oldest = serde_json::from_slice::<Value>(&records[0])
+        let oldest = crate::json::parse(&records[0])
             .ok()
-            .and_then(|v| v["ts"].as_str().and_then(ts::to_unix_nanos))
+            .and_then(|m| m.get("ts")?.as_str().and_then(ts::to_unix_nanos))
             .unwrap_or(0);
         let mut replaced = vec![false; records.len()];
         for (i, r) in records.iter_mut().enumerate() {

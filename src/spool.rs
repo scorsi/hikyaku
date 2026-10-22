@@ -686,8 +686,12 @@ fn segment_range(name: &str) -> Option<(u64, u64)> {
     Some((a.parse().ok()?, b.parse().ok()?))
 }
 
+/// Through `json::parse`: a kept service line can hold what serde_json refuses (`1e10000`).
 fn seq_of(record: &str) -> Option<u64> {
-    serde_json::from_str::<serde_json::Value>(record).ok()?["seq"].as_u64()
+    crate::json::parse(record.as_bytes())
+        .ok()?
+        .get("seq")?
+        .as_u64()
 }
 
 /// `hikyaku spool dump`: every spooled record as NDJSON, closed segments then the open one,

@@ -53,7 +53,10 @@ fn check(b: &[u8], record: bool) -> Result<(), String> {
         return Err(format!("reserved-field:{name}"));
     }
     field(&obj, "v", |v| v.as_u64().filter(|&n| n == 1))?;
-    field(&obj, "ts", |v| v.as_str().filter(|s| ts::is_timestamp(s)))?;
+    // A real date and time within signed 64-bit Unix nanoseconds, as in masu.
+    field(&obj, "ts", |v| {
+        v.as_str().filter(|s| ts::to_unix_nanos(s).is_some())
+    })?;
     let level = field(&obj, "level", |v| v.as_str().filter(|s| LEVELS.contains(s)))?;
     field(&obj, "event", |v| v.as_str().filter(|s| is_event(s)))?;
     optional(&obj, "msg", Value::as_str)?;

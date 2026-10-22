@@ -89,7 +89,7 @@ pub fn parse_entry(line: &[u8]) -> Option<Entry> {
     Some(Entry {
         cursor: text("__CURSOR")?,
         realtime_us: text("__REALTIME_TIMESTAMP")
-            .and_then(|s| s.parse().ok())
+            .and_then(realtime)
             .unwrap_or_else(now_us),
         unit,
         priority: text("PRIORITY").unwrap_or_default(),
@@ -112,7 +112,7 @@ fn cut_entry(line: &[u8]) -> Option<Entry> {
     Some(Entry {
         cursor: field("__CURSOR")?,
         realtime_us: field("__REALTIME_TIMESTAMP")
-            .and_then(|s| s.parse().ok())
+            .and_then(realtime)
             .unwrap_or_else(now_us),
         unit: field("_SYSTEMD_UNIT")
             .map(|u| u.strip_suffix(".service").unwrap_or(&u).to_string())
@@ -171,6 +171,12 @@ pub fn cursor_realtime_us(cursor: &str) -> Option<u64> {
         .and_then(|hex| u64::from_str_radix(hex, 16).ok())
 }
 
+/// `__REALTIME_TIMESTAMP` within the stores' range (signed 64-bit Unix nanoseconds), so a
+/// wrapped record never carries a `ts` they refuse.
+fn realtime(s: String) -> Option<u64> {
+    s.parse().ok().filter(|&us| us <= i64::MAX as u64 / 1000)
+}
+
 fn now_us() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -200,6 +206,19 @@ mod tests {
         let r = p.render("node-a", STREAM, 1);
         assert_eq!(check_record(r.as_bytes()), Ok(()), "{r}");
         serde_json::from_str(&r).unwrap()
+    }
+
+    #[test]
+    fn realtime_out_of_range_is_the_read_time() {
+        let far = SSHD.replace("1792397643512004", "9223372036854776");
+        let e = parse_entry(far.as_bytes()).unwrap();
+        assert!(e.realtime_us < 9_223_372_036_854_775);
+        record(classify(&e));
+        let edge = SSHD.replace("1792397643512004", "9223372036854775");
+        assert_eq!(
+            parse_entry(edge.as_bytes()).unwrap().realtime_us,
+            9_223_372_036_854_775
+        );
     }
 
     #[test]
