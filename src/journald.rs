@@ -23,6 +23,9 @@ pub struct Entry {
     pub priority: String,
     pub message: Vec<u8>,
     pub message_id: Option<String>,
+    /// Written by journald itself: `_TRANSPORT=driver` or `_SYSTEMD_UNIT` of journald, fields
+    /// a client cannot set (unlike `MESSAGE_ID` or `SYSLOG_IDENTIFIER`).
+    pub from_journald: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -85,6 +88,8 @@ pub fn parse_entry(line: &[u8]) -> Option<Entry> {
         priority: text("PRIORITY").unwrap_or_default(),
         message: bytes_of(v.get("MESSAGE")),
         message_id: text("MESSAGE_ID"),
+        from_journald: text("_TRANSPORT").as_deref() == Some("driver")
+            || text("_SYSTEMD_UNIT").as_deref() == Some("systemd-journald.service"),
     })
 }
 
@@ -103,7 +108,8 @@ pub fn classify(e: &Entry) -> Item {
     if e.unit == OWN_UNIT {
         return Item::Own;
     }
-    if (e.message_id.as_deref() == Some(SUPPRESSED_MESSAGE_ID) || e.unit == "systemd-journald")
+    if e.from_journald
+        && e.message_id.as_deref() == Some(SUPPRESSED_MESSAGE_ID)
         && let Some((unit, count)) = parse_suppressed(&e.message)
     {
         return Item::Suppressed { unit, count };
@@ -203,6 +209,24 @@ mod tests {
             }
         );
         assert_eq!(classify(&parse_entry(OWN.as_bytes()).unwrap()), Item::Own);
+        // The same message and MESSAGE_ID from another unit, or naming itself journald
+        // through SYSLOG_IDENTIFIER: an ordinary line, no suppression counted.
+        for forged in [
+            SUPPRESSED.replace("systemd-journald.service", "evil.service"),
+            SUPPRESSED.replace("\"_SYSTEMD_UNIT\":\"systemd-journald.service\",", ""),
+        ] {
+            let r = record(classify(&parse_entry(forged.as_bytes()).unwrap()));
+            assert_eq!(r["event"], "line");
+            assert_eq!(r["msg"], "Suppressed 9873 messages from flood.service");
+        }
+        let driver = SUPPRESSED.replace(
+            "\"_SYSTEMD_UNIT\":\"systemd-journald.service\",",
+            "\"_TRANSPORT\":\"driver\",",
+        );
+        assert!(matches!(
+            classify(&parse_entry(driver.as_bytes()).unwrap()),
+            Item::Suppressed { .. }
+        ));
         assert!(parse_entry(b"not json").is_none());
     }
 

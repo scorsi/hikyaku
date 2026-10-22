@@ -181,7 +181,8 @@ fn notify_ready() {
 
 /// Keeps a `journalctl --follow` child running from the saved cursor; batches its entries into
 /// the spool with the cursor of the last one. While the spool is paused nothing is read: the
-/// pipe fills and journalctl blocks, the journal keeps the lines (ADR 0004).
+/// child is stopped, the journal keeps the lines (ADR 0004), and a new child resumes from the
+/// committed cursor, so a rotation during the pause is a `journal-gap` (ADR 0011).
 fn journald_loop(agent: &Agent) {
     loop {
         let cursor = agent.spool.lock().unwrap().state.journal_cursor.clone();
@@ -219,9 +220,15 @@ fn journald_loop(agent: &Agent) {
         let mut batch: Vec<Pending> = Vec::new();
         let mut batch_bytes = 0;
         let mut last_cursor: Option<String> = None;
+        // Counters of the batch's own events, added once it is committed: entries read again
+        // after a pause must not count twice.
+        let mut gaps = 0;
+        let mut suppressed: Vec<(String, u64)> = Vec::new();
+        let mut paused = false;
         loop {
-            while agent.spool.lock().unwrap().is_paused(Signal::Logs) {
-                thread::sleep(Duration::from_secs(1));
+            if agent.spool.lock().unwrap().is_paused(Signal::Logs) {
+                paused = true;
+                break;
             }
             let room = agent.spool.lock().unwrap().room();
             let entry = match rx.recv_timeout(BATCH_WAIT) {
@@ -236,7 +243,7 @@ fn journald_loop(agent: &Agent) {
                         continue;
                     }
                     let from = cursor.as_deref().and_then(journald::cursor_realtime_us);
-                    agent.metrics.inc("hikyaku_journal_gaps_total", &[]);
+                    gaps += 1;
                     batch.push(own(
                         "warn",
                         "journal-gap",
@@ -252,11 +259,7 @@ fn journald_loop(agent: &Agent) {
                 match journald::classify(e) {
                     Item::Own => {}
                     Item::Suppressed { unit, count } => {
-                        agent.metrics.add(
-                            "hikyaku_journald_suppressed_lines_total",
-                            &[("unit", &unit)],
-                            count,
-                        );
+                        suppressed.push((unit.clone(), count));
                         batch.push(own(
                             "warn",
                             "journald-suppressed",
@@ -273,13 +276,29 @@ fn journald_loop(agent: &Agent) {
             {
                 let cursor = last_cursor.take();
                 agent.commit(Signal::Logs, &batch, |st| st.journal_cursor = cursor);
-                batch.clear();
-                batch_bytes = 0;
+                if gaps > 0 {
+                    agent.metrics.add("hikyaku_journal_gaps_total", &[], gaps);
+                }
+                for (unit, count) in suppressed.drain(..) {
+                    let labels = [("unit", unit.as_str())];
+                    agent
+                        .metrics
+                        .add("hikyaku_journald_suppressed_lines_total", &labels, count);
+                }
+                (batch, batch_bytes, gaps) = (Vec::new(), 0, 0);
             }
         }
+        // The uncommitted batch is dropped: the next child reads it again from the cursor.
+        drop(rx);
         let _ = child.kill();
         let _ = child.wait();
         let _ = reader.join();
+        if paused {
+            while agent.spool.lock().unwrap().is_paused(Signal::Logs) {
+                thread::sleep(Duration::from_secs(1));
+            }
+            continue;
+        }
         agent.event("error", "journald-exited", &[]);
         thread::sleep(RETRY);
     }
