@@ -359,7 +359,10 @@ impl<'a> Sender<'a> {
                     None => self.stop("400", reason),
                 }
             }
-            Response::Status(c @ 500..=599, _) => self.retry(&code, format!("http-{c}"), false),
+            // 408: masu did not receive the body in time; a transient failure, like a 5xx.
+            Response::Status(c @ (408 | 500..=599), _) => {
+                self.retry(&code, format!("http-{c}"), false)
+            }
             Response::Status(401, _) => match self.client.reload_token() {
                 // The token file was rotated since it was read: try the new token at once.
                 Ok(true) => Next::Again,
@@ -746,6 +749,7 @@ mod tests {
             }),
             Box::new(|_| (507, Vec::new())),
             Box::new(|_| (503, Vec::new())),
+            Box::new(|_| (408, Vec::new())),
             Box::new(ack),
         ]);
         let agent = agent("stop", &url);
@@ -789,13 +793,15 @@ mod tests {
             a <= BACKOFF_MIN && b <= 2 * BACKOFF_MIN && b >= BACKOFF_MIN / 2,
             "{a:?} {b:?}"
         );
+        let Next::Wait(c) = s.step() else { panic!() };
+        assert!(c <= 4 * BACKOFF_MIN, "408 backs off, never stops: {c:?}");
         s.step();
         assert!(acked(&agent) >= 1);
         let m = agent
             .metrics
             .render(&agent.spool.lock().unwrap().snapshot());
         for code in [
-            "400\"} 3", "401\"} 1", "403\"} 1", "507\"} 1", "5xx\"} 1", "200\"} 1",
+            "400\"} 3", "401\"} 1", "403\"} 1", "507\"} 1", "5xx\"} 1", "408\"} 1", "200\"} 1",
         ] {
             assert!(
                 m.contains(&format!(

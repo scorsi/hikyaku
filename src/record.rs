@@ -187,7 +187,8 @@ fn refused_origin(refused: &[u8]) -> (String, String) {
     let v: Value = serde_json::from_slice(refused).unwrap_or(Value::Null);
     let ts = v["ts"]
         .as_str()
-        .filter(|s| crate::ts::is_timestamp(s))
+        // Valid for both stores: masu also wants it within i64 nanoseconds.
+        .filter(|s| crate::ts::to_unix_nanos(s).is_some())
         .map_or_else(crate::ts::now, str::to_string);
     let service = v["service"]
         .as_str()

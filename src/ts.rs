@@ -55,7 +55,8 @@ pub fn to_unix_nanos(s: &str) -> Option<i64> {
         .ok()
 }
 
-/// `2026-10-19T08:14:00.000213904Z`: shape, then a real UTC date and time.
+/// `2026-10-19T08:14:00.000213904Z`: shape, then a real UTC date and time (nisshi's rule;
+/// masu also wants it within `to_unix_nanos`'s range).
 pub fn is_timestamp(s: &str) -> bool {
     let b = s.as_bytes();
     if b.len() != 30 || !s.is_ascii() {

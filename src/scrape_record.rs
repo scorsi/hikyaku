@@ -31,7 +31,10 @@ pub fn check(b: &[u8]) -> Result<(), String> {
         return Err("reserved-field:recv_ts".into());
     }
     field(&obj, "v", |v| v.as_u64().filter(|&n| n == 1))?;
-    field(&obj, "ts", |v| v.as_str().filter(|s| ts::is_timestamp(s)))?;
+    // masu: a real date and time that fits signed 64-bit Unix nanoseconds.
+    field(&obj, "ts", |v| {
+        v.as_str().filter(|s| ts::to_unix_nanos(s).is_some())
+    })?;
     field(&obj, "node", |v| v.as_str().filter(|s| json::is_node(s)))?;
     field(&obj, "service", Value::as_str)?;
     field(&obj, "stream", |v| {
