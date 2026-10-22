@@ -20,37 +20,64 @@ pub struct Polled {
 
 impl Tail {
     /// Reads up to `limit` complete lines appended since the last poll; a partial last line
-    /// waits for its newline.
+    /// waits for its newline. The position moves only when the whole poll succeeded, so an I/O
+    /// error mid-way reads the same lines again at the next poll.
     pub fn poll(&mut self, limit: usize) -> io::Result<Polled> {
         let mut out = Polled {
             lines: Vec::new(),
             truncated: false,
         };
-        let meta = match fs::metadata(&self.path) {
+        // The path is looked at without following a link, then the bytes and the size come
+        // from the descriptor itself: a symlink planted in place of the log is refused, and a
+        // rotation between the two calls (other inode) is retried at the next poll.
+        let link = match fs::symlink_metadata(&self.path) {
             Ok(m) => m,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(out),
             Err(e) => return Err(e),
         };
-        if (self.inode != 0 && meta.ino() != self.inode) || meta.len() < self.offset {
+        if !link.file_type().is_file() {
+            return Err(io::Error::other(
+                "not a regular file (symlinks are refused)",
+            ));
+        }
+        let f = match File::open(&self.path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(out),
+            Err(e) => return Err(e),
+        };
+        let meta = f.metadata()?;
+        if (meta.dev(), meta.ino()) != (link.dev(), link.ino()) {
+            return Ok(out);
+        }
+        let mut offset = self.offset;
+        if (self.inode != 0 && meta.ino() != self.inode) || meta.len() < offset {
             out.truncated = true;
-            self.offset = 0;
+            offset = 0;
         }
-        self.inode = meta.ino();
-        let mut f = File::open(&self.path)?;
-        f.seek(SeekFrom::Start(self.offset))?;
         let mut reader = BufReader::new(f);
-        while out.lines.len() < limit {
-            let mut line = Vec::new();
-            let n = reader.read_until(b'\n', &mut line)?;
-            if n == 0 || line.last() != Some(&b'\n') {
-                break;
-            }
-            self.offset += n as u64;
-            line.pop();
-            out.lines.push(line);
-        }
+        reader.seek(SeekFrom::Start(offset))?;
+        let (lines, read) = read_lines(&mut reader, limit)?;
+        out.lines = lines;
+        (self.inode, self.offset) = (meta.ino(), offset + read);
         Ok(out)
     }
+}
+
+/// Up to `limit` complete lines (without their newline) and the bytes they took; an error
+/// drops them all, so that the caller's position stays where it was.
+fn read_lines(reader: &mut impl BufRead, limit: usize) -> io::Result<(Vec<Vec<u8>>, u64)> {
+    let (mut lines, mut read) = (Vec::new(), 0);
+    while lines.len() < limit {
+        let mut line = Vec::new();
+        let n = reader.read_until(b'\n', &mut line)?;
+        if n == 0 || line.last() != Some(&b'\n') {
+            break;
+        }
+        read += n as u64;
+        line.pop();
+        lines.push(line);
+    }
+    Ok((lines, read))
 }
 
 #[cfg(test)]
@@ -92,5 +119,37 @@ mod tests {
         assert!(p.truncated);
         assert_eq!(p.lines, [b"rotated-longer".to_vec()]);
         assert_eq!(tail.offset, 15);
+
+        // A symlink planted in place of the log: refused, nothing read, position kept.
+        let secret = dir.join("secret");
+        fs::write(&secret, b"root only\n").unwrap();
+        fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(&secret, &path).unwrap();
+        assert!(tail.poll(1000).is_err());
+        assert_eq!(tail.offset, 15);
+    }
+
+    /// A reader that fails after its bytes, as a disk returning EIO mid-poll.
+    struct FailAfter<'a>(&'a [u8]);
+    impl io::Read for FailAfter<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.0.is_empty() {
+                return Err(io::Error::other("EIO"));
+            }
+            let n = self.0.len().min(buf.len());
+            buf[..n].copy_from_slice(&self.0[..n]);
+            self.0 = &self.0[n..];
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn a_read_error_keeps_the_lines_for_the_next_poll() {
+        let mut ok = BufReader::new(&b"one\ntwo\npart"[..]);
+        assert_eq!(read_lines(&mut ok, 10).unwrap().1, 8);
+        // One complete line read, then an error: nothing is returned, so the tail's offset is
+        // not moved and the line is read again.
+        let mut failing = BufReader::with_capacity(4, FailAfter(b"one\ntwo"));
+        assert!(read_lines(&mut failing, 10).is_err());
     }
 }
