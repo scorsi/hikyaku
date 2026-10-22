@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// `(name, type, help)` of every family, in exposition order.
 const FAMILIES: &[(&str, &str, &str)] = &[
@@ -154,16 +154,26 @@ fn sample(name: &str, labels: &[(&str, &str)]) -> String {
 
 /// Answers every request on `listener` with the exposition `render` returns.
 pub fn serve(listener: TcpListener, render: impl Fn() -> String) {
+    serve_within(listener, Duration::from_secs(5), render)
+}
+
+/// Connections are served one at a time: the request head gets `deadline` in all, so a client
+/// trickling bytes cannot hold the listener for longer.
+fn serve_within(listener: TcpListener, deadline: Duration, render: impl Fn() -> String) {
     for conn in listener.incoming() {
         let Ok(mut conn) = conn else { continue };
-        let _ = conn.set_read_timeout(Some(Duration::from_secs(5)));
-        let _ = conn.set_write_timeout(Some(Duration::from_secs(5)));
+        let _ = conn.set_write_timeout(Some(deadline));
         // Read the request head; whatever it asks for, the answer is the exposition.
+        let end = Instant::now() + deadline;
         let mut head = Vec::new();
-        let mut byte = [0u8; 1];
-        while head.len() < 8192 && !head.ends_with(b"\r\n\r\n") {
-            match conn.read(&mut byte) {
-                Ok(1) => head.push(byte[0]),
+        let mut buf = [0u8; 1024];
+        while head.len() < 8192 && !head.windows(4).any(|w| w == b"\r\n\r\n") {
+            let left = end.saturating_duration_since(Instant::now());
+            if left.is_zero() || conn.set_read_timeout(Some(left)).is_err() {
+                break;
+            }
+            match conn.read(&mut buf) {
+                Ok(n) if n > 0 => head.extend_from_slice(&buf[..n]),
                 _ => break,
             }
         }
@@ -210,5 +220,38 @@ mod tests {
         assert!(out.ends_with('\n'));
         let types = out.matches("# TYPE").count();
         assert_eq!(types, FAMILIES.len());
+    }
+
+    #[test]
+    fn a_trickling_client_cannot_hold_the_listener() {
+        use std::net::TcpStream;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            serve_within(listener, Duration::from_millis(500), || "x 1\n".into())
+        });
+        // One byte every 200 ms: each read is quick, the head never ends.
+        let slow = std::thread::spawn(move || {
+            let mut c = TcpStream::connect(addr).unwrap();
+            for _ in 0..20 {
+                if c.write_all(b"G").is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        let start = Instant::now();
+        let mut c = TcpStream::connect(addr).unwrap();
+        c.write_all(b"GET /metrics HTTP/1.1\r\n\r\n").unwrap();
+        let mut out = String::new();
+        c.read_to_string(&mut out).unwrap();
+        assert!(out.ends_with("x 1\n"), "{out}");
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            start.elapsed()
+        );
+        slow.join().unwrap();
     }
 }
