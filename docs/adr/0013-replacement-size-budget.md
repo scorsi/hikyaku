@@ -1,6 +1,6 @@
 # ADR 0013 — Records sized so that their replacement fits
 
-Status: Proposed — 2026-10-22
+Status: Accepted — 2026-10-22
 
 Amends [ADR 0003](0003-sources.md) (the scrape body cap) and [ADR 0005](0005-delivery.md)
 (the size guarantee of a replacement).
