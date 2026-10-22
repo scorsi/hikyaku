@@ -27,8 +27,11 @@ replacement. Such a replacement is refused in its turn and the stream stops (rev
 - The store's reason is cut to 256 bytes, and the replacement's `service` falls back to
   `hikyaku` above 256 bytes, so the envelope stays bounded.
 - A replacement is validated with the stores' rules before it is committed; one that does not
-  pass (a record spooled before this budget) stops the stream with `replacement-rejected`,
-  as a refused replacement does.
+  pass stops the stream with `replacement-rejected`, as a refused replacement does.
+- A record spooled before this budget, whose whole replacement would exceed the stores'
+  record limit, is replaced anyway: `raw_b64` keeps the beginning of the refused bytes, cut to
+  fit the limit, and the replacement carries `"truncated": true`; the stream goes on.
+  `hikyaku_truncated_replacements_total{signal}` counts them (owner decision of 2026-10-22).
 - The `reason` label of `hikyaku_rejected_records_total` is the reason's class, the part
   before the first `:` (`duplicate-field`, not `duplicate-field:<name>`), so its cardinality
   stays bounded; the `record-rejected` event keeps the full reason.
@@ -36,6 +39,8 @@ replacement. Such a replacement is refused in its turn and the stream stops (rev
 ## Consequences
 
 - No store contract changes: the record limit and the replacement shape are unchanged.
-- Open question for the owner: a record already spooled above the budget (before this
-  change) cannot be replaced whole. Keeping it means the stream stays stopped on it; sending
-  it truncated, or skipping its seq, changes ADR 0005's "never lost" guarantee.
+- A record already spooled above the budget (before this change) cannot be replaced whole: its
+  `seq` is kept and the stream goes on, but only the beginning of its bytes reaches the store.
+  This is the one exception to ADR 0005's "never lost" guarantee, visible as `truncated` on
+  the stored record and in the counter. nisshi's table of the stack's own events and masu's
+  record table gain the `truncated` field (their docs, not a rule change).

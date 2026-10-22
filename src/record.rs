@@ -198,27 +198,41 @@ fn refused_origin(refused: &[u8]) -> (String, String) {
     (ts, service)
 }
 
-/// The record sent in place of a log record nisshi refused: `rejected`, same `seq`.
-pub fn rejected_log(refused: &[u8], reason: &str, node: &str, stream: &str, seq: u64) -> String {
+/// The record sent in place of a log record nisshi refused: `rejected`, same `seq`; `true`
+/// when `raw_b64` had to be cut (below).
+pub fn rejected_log(
+    refused: &[u8],
+    reason: &str,
+    node: &str,
+    stream: &str,
+    seq: u64,
+) -> (String, bool) {
     let (ts, service) = refused_origin(refused);
-    PendingLog {
-        line: service_line(
-            &ts,
-            "error",
-            "rejected",
-            &[("err", reason.into()), ("raw_b64", base64(refused).into())],
-        ),
-        service,
-        source: None,
-    }
-    .render(node, stream, seq)
+    fit(refused, |raw, truncated| {
+        let mut fields = vec![("err", reason.into()), ("raw_b64", base64(raw).into())];
+        if truncated {
+            fields.push(("truncated", true.into()));
+        }
+        PendingLog {
+            line: service_line(&ts, "error", "rejected", &fields),
+            service: service.clone(),
+            source: None,
+        }
+        .render(node, stream, seq)
+    })
 }
 
 /// The record sent in place of a scrape record masu refused: `up:false`,
-/// `error:"rejected:<reason>"`, `raw_b64`, same `seq`.
-pub fn rejected_scrape(refused: &[u8], reason: &str, node: &str, stream: &str, seq: u64) -> String {
+/// `error:"rejected:<reason>"`, `raw_b64`, same `seq`; `true` when `raw_b64` had to be cut.
+pub fn rejected_scrape(
+    refused: &[u8],
+    reason: &str,
+    node: &str,
+    stream: &str,
+    seq: u64,
+) -> (String, bool) {
     let (ts, service) = refused_origin(refused);
-    let mut out = Scrape {
+    let head = Scrape {
         ts,
         service,
         dur_us: 0,
@@ -227,9 +241,24 @@ pub fn rejected_scrape(refused: &[u8], reason: &str, node: &str, stream: &str, s
         },
     }
     .render(node, stream, seq);
-    out.pop();
-    out.push_str(&format!(",\"raw_b64\":\"{}\"}}", base64(refused)));
-    out
+    let head = head.strip_suffix('}').unwrap_or(&head);
+    fit(refused, |raw, truncated| {
+        let tail = if truncated { ",\"truncated\":true" } else { "" };
+        format!("{head},\"raw_b64\":\"{}\"{tail}}}", base64(raw))
+    })
+}
+
+/// A record spooled before the size budget (ADR 0013) can give a replacement over the stores'
+/// limit: `raw_b64` then keeps the beginning of the refused bytes, with `truncated:true`, so the
+/// stream goes on (owner decision of 2026-10-22).
+fn fit(refused: &[u8], build: impl Fn(&[u8], bool) -> String) -> (String, bool) {
+    let whole = build(refused, false);
+    if whole.len() <= MAX_RECORD_BYTES {
+        return (whole, false);
+    }
+    let over = whole.len() + r#","truncated":true"#.len() - MAX_RECORD_BYTES;
+    let keep = (refused.len().div_ceil(3) * 4).saturating_sub(over) / 4 * 3;
+    (build(&refused[..keep], true), true)
 }
 
 fn trim_ascii(b: &[u8]) -> &[u8] {
@@ -406,7 +435,7 @@ mod tests {
     #[test]
     fn replacements_pass_the_stores_rules() {
         let refused = br#"{"v":1,"ts":"2026-10-19T08:14:03.512004117Z","level":"info","event":"x","node":"node-a","service":"annai","stream":"9b1e0c5d7a2f4e8b9c0d1e2f3a4b5c6d","seq":7,"n":1}"#;
-        let r = rejected_log(refused, "test-refused", "node-a", STREAM, 7);
+        let r = rejected_log(refused, "test-refused", "node-a", STREAM, 7).0;
         assert_eq!(check_record(r.as_bytes()), Ok(()), "{r}");
         let v: Value = serde_json::from_str(&r).unwrap();
         assert_eq!(
@@ -428,21 +457,21 @@ mod tests {
         assert_eq!(v["ts"], "2026-10-19T08:14:03.512004117Z");
         assert_eq!(v["raw_b64"], base64(refused));
         // Unreadable: the agent's time and service.
-        let r = rejected_log(&[0xff, b'{'], "not-utf8", "node-a", STREAM, 8);
+        let r = rejected_log(&[0xff, b'{'], "not-utf8", "node-a", STREAM, 8).0;
         assert_eq!(check_record(r.as_bytes()), Ok(()), "{r}");
         let v: Value = serde_json::from_str(&r).unwrap();
         assert_eq!(v["service"], "hikyaku");
         assert!(crate::ts::is_timestamp(v["ts"].as_str().unwrap()));
 
         let scrape = br#"{"v":1,"ts":"2026-10-19T08:14:03.512004117Z","node":"node-a","service":"annai","stream":"9b1e0c5d7a2f4e8b9c0d1e2f3a4b5c6d","seq":3,"up":true,"dur_us":1,"content_type":"text/plain","body":"a 1\n"}"#;
-        let r = rejected_scrape(scrape, "body-format", "node-a", STREAM, 3);
+        let r = rejected_scrape(scrape, "body-format", "node-a", STREAM, 3).0;
         assert_eq!(scrape_record::check(r.as_bytes()), Ok(()), "{r}");
         let v: Value = serde_json::from_str(&r).unwrap();
         assert_eq!(v["error"], "rejected:body-format");
         assert_eq!(v["up"], false);
         assert_eq!(v["service"], "annai");
         assert_eq!(v["raw_b64"], base64(scrape));
-        let r = rejected_scrape(b"[1]", "not-object", "node-a", STREAM, 4);
+        let r = rejected_scrape(b"[1]", "not-object", "node-a", STREAM, 4).0;
         assert_eq!(scrape_record::check(r.as_bytes()), Ok(()), "{r}");
     }
 
@@ -470,7 +499,7 @@ mod tests {
             assert!(r.len() <= MAX_REPLACEABLE_BYTES, "{}", r.len());
             // The worst envelope: longest reason and service the replacement can carry.
             let r = r.replace("\"service\":\"svc\"", &format!("\"service\":\"{service}\""));
-            let rep = rejected_log(r.as_bytes(), &reason, "node-a", STREAM, 7);
+            let rep = rejected_log(r.as_bytes(), &reason, "node-a", STREAM, 7).0;
             assert_eq!(check_record(rep.as_bytes()), Ok(()), "{}", rep.len());
         }
         // A scrape record at the budget gives a replacement masu accepts.
@@ -486,12 +515,55 @@ mod tests {
         }
         .render("node-a", STREAM, 7);
         assert!(scrape.len() <= MAX_REPLACEABLE_BYTES);
-        let rep = rejected_scrape(scrape.as_bytes(), &reason, "node-a", STREAM, 7);
+        let rep = rejected_scrape(scrape.as_bytes(), &reason, "node-a", STREAM, 7).0;
         assert_eq!(
             scrape_record::check(rep.as_bytes()),
             Ok(()),
             "{}",
             rep.len()
         );
+    }
+
+    #[test]
+    fn oversized_records_get_a_truncated_replacement() {
+        // Spooled before ADR 0013's budget: whole, its base64 would not fit the store limit.
+        let msg = "x".repeat(MAX_RECORD_BYTES - 1000);
+        let big = PendingLog {
+            line: service_line(TS, "info", "line", &[("msg", msg.into())]),
+            service: "svc".into(),
+            source: None,
+        }
+        .render("node-a", STREAM, 7);
+        assert!(big.len() > MAX_REPLACEABLE_BYTES, "{}", big.len());
+        let (rep, truncated) = rejected_log(big.as_bytes(), "x", "node-a", STREAM, 7);
+        assert!(truncated);
+        assert_eq!(check_record(rep.as_bytes()), Ok(()), "{}", rep.len());
+        let v: Value = serde_json::from_str(&rep).unwrap();
+        assert_eq!(v["truncated"], true);
+        let raw = v["raw_b64"].as_str().unwrap();
+        assert!(base64(big.as_bytes()).starts_with(&raw[..raw.len() - 4]));
+        assert!(
+            rep.len() > MAX_RECORD_BYTES - 8,
+            "fills the limit: {}",
+            rep.len()
+        );
+
+        let body = "a".repeat(MAX_RECORD_BYTES - 400);
+        let scrape = Scrape {
+            ts: TS.into(),
+            service: "svc".into(),
+            dur_us: 1,
+            result: ScrapeResult::Up {
+                content_type: "text/plain".into(),
+                body,
+            },
+        }
+        .render("node-a", STREAM, 7);
+        let (rep, truncated) = rejected_scrape(scrape.as_bytes(), "x", "node-a", STREAM, 7);
+        assert!(truncated);
+        assert_eq!(scrape_record::check(rep.as_bytes()), Ok(()));
+        assert!(rep.ends_with(r#","truncated":true}"#));
+        // A record that fits is never cut.
+        assert!(!rejected_log(b"{}", "x", "node-a", STREAM, 7).1);
     }
 }

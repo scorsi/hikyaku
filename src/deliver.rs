@@ -409,12 +409,11 @@ impl<'a> Sender<'a> {
                 spool.state.stream(self.signal).stream.clone(),
             )
         };
-        let record = match self.signal {
+        let (record, truncated) = match self.signal {
             Signal::Logs => rejected_log(refused, &reason, &node, &stream, seq),
             Signal::Metrics => rejected_scrape(refused, &reason, &node, &stream, seq),
         };
-        // Checked before it is persisted: a record spooled before the size budget (ADR 0013)
-        // can give a replacement over the stores' limit, which would be refused in its turn.
+        // Checked before it is persisted: the stores would refuse an invalid one in its turn.
         let valid = match self.signal {
             Signal::Logs => crate::logschema::check_record(record.as_bytes()),
             Signal::Metrics => crate::scrape_record::check(record.as_bytes()),
@@ -444,6 +443,12 @@ impl<'a> Sender<'a> {
             "hikyaku_rejected_records_total",
             &[("signal", self.signal.name()), ("reason", class)],
         );
+        if truncated {
+            self.agent.metrics.inc(
+                "hikyaku_truncated_replacements_total",
+                &[("signal", self.signal.name())],
+            );
+        }
         self.event(
             "error",
             "record-rejected",
@@ -928,11 +933,11 @@ mod tests {
     }
 
     #[test]
-    fn an_oversized_legacy_record_is_not_replaced() {
+    fn an_oversized_legacy_record_gets_a_truncated_replacement() {
         let agent = agent("legacy", "http://127.0.0.1:9");
         records(&agent, 1);
         let mut s = sender(&agent);
-        // A record spooled before the size budget: its replacement would exceed 4 MiB.
+        // A record spooled before the size budget: whole, its replacement would exceed 4 MiB.
         let batch = Batch {
             first: 1,
             records: vec![vec![b'a'; 3_500_000]],
@@ -940,18 +945,23 @@ mod tests {
             more: false,
             body: Vec::new(),
         };
-        assert_eq!(s.replace(&batch, 0, "x".into()), Next::Wait(STOPPED_RETRY));
-        let mut spool = agent.spool.lock().unwrap();
-        assert!(
-            spool.replacement(Signal::Logs, 1).is_none(),
-            "not persisted"
+        assert_eq!(
+            s.replace(&batch, 0, "x".into()),
+            Next::Again,
+            "the stream goes on"
         );
-        assert!(
-            spool
-                .read(Signal::Logs, 1, usize::MAX, usize::MAX)
-                .unwrap()
-                .iter()
-                .any(|r| String::from_utf8_lossy(r).contains("\"event\":\"replacement-rejected\""))
-        );
+        let saved = agent
+            .spool
+            .lock()
+            .unwrap()
+            .replacement(Signal::Logs, 1)
+            .unwrap()
+            .clone();
+        assert_eq!(crate::logschema::check_record(saved.as_bytes()), Ok(()));
+        assert!(saved.contains(r#""event":"rejected""#) && saved.contains(r#""truncated":true"#));
+        let m = agent
+            .metrics
+            .render(&agent.spool.lock().unwrap().snapshot());
+        assert!(m.contains("hikyaku_truncated_replacements_total{signal=\"logs\"} 1\n"));
     }
 }

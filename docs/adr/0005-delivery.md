@@ -62,7 +62,9 @@ implementations must cost one record, not a stream.
   the stored `rejected` record itself at `level:"error"`.
   Event fields amended by [ADR 0010](0010-delivery-event-fields.md): `rejected_seq`, not
   `seq`; the stopped-stream and other push failures are named there.
-- **Guard**: if the store refuses the replacement too, the two validators disagree on the
+- **Guard**: a replacement over the stores' record limit (a record spooled before
+  [ADR 0013](0013-replacement-size-budget.md)'s budget) is sent with `raw_b64` cut to fit and
+  `"truncated": true` (amended, accepted 2026-10-22). If the store refuses the replacement too, the two validators disagree on the
   minimal record itself: the stream stops and retries every 5 minutes, as for a request-level
   400.
 - **Agent status** in every request: spool bytes, limit, `paused`, oldest unacked timestamp.
@@ -75,5 +77,6 @@ implementations must cost one record, not a stream.
   nothing is lost while the spool holds.
 - Restart mid-request: the batch is resent from `acked_seq + 1`; the store drops what it had
   already committed.
-- A record the stores refuse is kept in the store as `raw_b64`, never lost, and visible as an
+- A record the stores refuse is kept in the store as `raw_b64`, never lost (except a record
+  spooled before ADR 0013's budget, kept only in part with `truncated`), and visible as an
   error; fixing the validator disagreement is a bug fix, not a recovery.

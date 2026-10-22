@@ -57,6 +57,11 @@ const FAMILIES: &[(&str, &str, &str)] = &[
         "Records a store refused, replaced by a rejected record, per signal and reason.",
     ),
     (
+        "hikyaku_truncated_replacements_total",
+        "counter",
+        "Replacements whose raw_b64 keeps only the beginning of a record spooled over the size budget.",
+    ),
+    (
         "hikyaku_record_bugs_total",
         "counter",
         "Records the agent built that its own validation refused.",
@@ -123,6 +128,7 @@ impl Metrics {
                     "hikyaku_journald_suppressed_lines_total",
                     "hikyaku_push_requests_total",
                     "hikyaku_rejected_records_total",
+                    "hikyaku_truncated_replacements_total",
                 ]
                 .contains(name)
                 {

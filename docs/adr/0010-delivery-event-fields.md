@@ -15,6 +15,9 @@ test of M2). ADR 0005 also asks for an `error` event on a stopped stream without
 - `record-rejected` (`level:"error"`): `signal`, `rejected_seq`, `reason`.
 - `replacement-rejected` (`error`): the store refused the replacement too, the stream stops;
   `signal`, `rejected_seq`, `err` (the store's reason).
+- `rejected` (the replacement record itself, ADR 0005) carries `"truncated": true` when its
+  `raw_b64` keeps only the beginning of the refused bytes (ADR 0013; amended, accepted 2026-10-22); the
+  masu replacement carries the same member.
 - `record-too-large` (`error`): a single record answered 413; `signal`, `rejected_seq`.
 - `push-error`: any other failed push; `signal`, `code` (the `code` label of
   `hikyaku_push_requests_total`), `err` (`http-<code>`, the store's request-level reason, or
