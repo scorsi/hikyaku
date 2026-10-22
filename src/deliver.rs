@@ -35,6 +35,7 @@ pub struct Client {
     http: ureq::Agent,
     url: String,
     token: String,
+    token_file: std::path::PathBuf,
 }
 
 /// What the store answered, before interpretation.
@@ -49,16 +50,13 @@ pub enum Response {
 }
 
 impl Client {
-    /// The token is read once (systemd `LoadCredential`); it never appears in an error.
+    /// The token is read here and again after a 401 (`reload_token`), so a rotated token file
+    /// is picked up without a restart; it never appears in an error.
     pub fn new(d: &Destination) -> Result<Client, String> {
-        let token = std::fs::read_to_string(&d.token_file)
-            .map_err(|e| format!("token_file {}: {e}", d.token_file.display()))?
-            .trim()
-            .to_string();
-        if token.is_empty() {
-            return Err(format!("token_file {}: empty", d.token_file.display()));
-        }
-        let mut builder = ureq::AgentBuilder::new().timeout(TIMEOUT);
+        let token = read_token(&d.token_file)?;
+        // No redirect: an ack must come from the configured store over TLS, never from
+        // wherever a 3xx points (an http:// hop could forge acked_seq).
+        let mut builder = ureq::AgentBuilder::new().timeout(TIMEOUT).redirects(0);
         if let Some(ca) = &d.ca_file {
             let roots = CertificateDer::pem_file_iter(ca)
                 .and_then(|certs| certs.collect::<Result<Vec<_>, _>>())
@@ -106,7 +104,16 @@ impl Client {
             http: builder.build(),
             url,
             token,
+            token_file: d.token_file.clone(),
         })
+    }
+
+    /// Reads the token file again; true when it holds another valid token.
+    pub fn reload_token(&mut self) -> Result<bool, String> {
+        let token = read_token(&self.token_file)?;
+        let changed = token != self.token;
+        self.token = token;
+        Ok(changed)
     }
 
     pub fn push(&self, body: &[u8]) -> Response {
@@ -141,6 +148,21 @@ impl Client {
         }
         Response::Status(status, body)
     }
+}
+
+/// One line of visible ASCII (RFC 6750's token characters are a subset): anything else would
+/// make an invalid header, and the HTTP library would quote the whole header, token included,
+/// in its error. The errors here never carry the file's content.
+fn read_token(path: &std::path::Path) -> Result<String, String> {
+    let text = std::fs::read(path).map_err(|e| format!("token_file {}: {e}", path.display()))?;
+    let token = text.trim_ascii();
+    if token.is_empty() || token.len() > 4096 || !token.iter().all(|c| c.is_ascii_graphic()) {
+        return Err(format!(
+            "token_file {}: not one line of visible ASCII characters (at most 4096)",
+            path.display()
+        ));
+    }
+    Ok(String::from_utf8_lossy(token).into_owned())
 }
 
 /// The `code` label of `hikyaku_push_requests_total` (masu's metric convention).
@@ -337,7 +359,28 @@ impl<'a> Sender<'a> {
                 }
             }
             Response::Status(c @ 500..=599, _) => self.retry(&code, format!("http-{c}"), false),
-            Response::Status(c, _) => self.stop(&c.to_string(), format!("http-{c}")),
+            Response::Status(401, _) => match self.client.reload_token() {
+                // The token file was rotated since it was read: try the new token at once.
+                Ok(true) => Next::Again,
+                Ok(false) => self.stop("401", "http-401".into()),
+                Err(e) => self.stop("401", e),
+            },
+            Response::Status(c, body) => {
+                // A 403 says why (masu, nisshi: "stream-owner", wrong role) when it has a body.
+                let reason = match self.signal {
+                    Signal::Logs => {
+                        nisshi_v1::PushRejected::decode(body.as_slice()).map(|r| r.reason)
+                    }
+                    Signal::Metrics => {
+                        masu_v1::PushRejected::decode(body.as_slice()).map(|r| r.reason)
+                    }
+                };
+                let err = reason
+                    .ok()
+                    .filter(|r| c == 403 && !r.is_empty())
+                    .map_or_else(|| format!("http-{c}"), bounded);
+                self.stop(&c.to_string(), err)
+            }
             Response::Network { err, tls } => self.retry("network", err, tls),
         }
     }
@@ -417,6 +460,18 @@ impl<'a> Sender<'a> {
     }
 }
 
+/// A store's reason, cut to 256 bytes: it goes into events, replacements and the state.
+fn bounded(mut reason: String) -> String {
+    if reason.len() > 256 {
+        let mut end = 256;
+        while !reason.is_char_boundary(end) {
+            end -= 1;
+        }
+        reason.truncate(end);
+    }
+    reason
+}
+
 /// Between half and all of `d`.
 fn jitter(d: Duration) -> Duration {
     let nanos = SystemTime::now()
@@ -475,7 +530,7 @@ mod tests {
 
     /// A plain-HTTP fake store: answers each push with the next reply, hands the decoded
     /// request to the test.
-    fn fake_store(replies: Vec<Reply>) -> (String, Receiver<nisshi_v1::PushRequest>) {
+    fn fake_store(replies: Vec<Reply>) -> (String, Receiver<(String, nisshi_v1::PushRequest)>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let (tx, rx) = channel();
@@ -499,7 +554,6 @@ mod tests {
                         break;
                     }
                 }
-                assert_eq!(auth, "Authorization: Bearer secret-token");
                 let mut body = vec![0; len];
                 reader.read_exact(&mut body).unwrap();
                 let pb = zstd::decode_all(body.as_slice()).unwrap();
@@ -513,7 +567,7 @@ mod tests {
                 )
                 .unwrap();
                 conn.write_all(&out).unwrap();
-                let _ = tx.send(req);
+                let _ = tx.send((auth, req));
             }
         });
         (url, rx)
@@ -593,7 +647,8 @@ mod tests {
         records(&agent, 3);
         let mut s = sender(&agent);
         assert_eq!(s.step(), Next::Again);
-        let first = rx.recv().unwrap();
+        let (auth, first) = rx.recv().unwrap();
+        assert_eq!(auth, "Authorization: Bearer secret-token");
         assert_eq!((first.first_seq, first.records.len()), (1, 3));
         assert_eq!(first.node, "node-a");
         assert_eq!(first.stream_id.len(), 16);
@@ -617,12 +672,12 @@ mod tests {
 
         // 413: half the records, at once.
         assert_eq!(s.step(), Next::Again);
-        let second = rx.recv().unwrap();
+        let second = rx.recv().unwrap().1;
         assert_eq!(second.records.len(), 4);
         assert_eq!(second.records[1], saved.as_bytes());
         // Half of them acked, the rest still pending: at once.
         assert_eq!(s.step(), Next::Again);
-        let third = rx.recv().unwrap();
+        let third = rx.recv().unwrap().1;
         assert_eq!(third.records.len(), 2);
         assert_eq!(acked(&agent), 2);
         let spool = agent.spool.lock().unwrap();
@@ -658,7 +713,16 @@ mod tests {
                 )
             }),
             Box::new(|_| (401, Vec::new())),
-            Box::new(|_| (403, Vec::new())),
+            Box::new(|_| {
+                (
+                    403,
+                    nisshi_v1::PushRejected {
+                        record_index: None,
+                        reason: "stream-owner".into(),
+                    }
+                    .encode_to_vec(),
+                )
+            }),
             Box::new(|_| (507, Vec::new())),
             Box::new(|_| (503, Vec::new())),
             Box::new(ack),
@@ -672,7 +736,7 @@ mod tests {
             Next::Wait(STOPPED_RETRY),
             "the replacement refused too"
         );
-        let second = rx.recv().and_then(|_| rx.recv()).unwrap();
+        let second = rx.recv().and_then(|_| rx.recv()).unwrap().1;
         assert!(
             std::str::from_utf8(&second.records[0])
                 .unwrap()
@@ -682,6 +746,22 @@ mod tests {
             assert_eq!(s.step(), Next::Wait(STOPPED_RETRY));
         }
         assert_eq!(acked(&agent), 0);
+        // The 403's reason is the push-error's err.
+        let spooled = agent
+            .spool
+            .lock()
+            .unwrap()
+            .read(Signal::Logs, 1, usize::MAX, usize::MAX)
+            .unwrap();
+        assert!(
+            spooled.iter().any(|r| {
+                let r = String::from_utf8_lossy(r);
+                r.contains("\"event\":\"push-error\"")
+                    && r.contains("\"err\":\"stream-owner\"")
+                    && r.contains("\"code\":\"403\"")
+            }),
+            "no push-error with the 403 reason"
+        );
         let Next::Wait(a) = s.step() else { panic!() };
         let Next::Wait(b) = s.step() else { panic!() };
         assert!(
@@ -745,5 +825,65 @@ mod tests {
         let err = Client::new(&d).err().unwrap();
         assert!(err.starts_with("ca_file /nonexistent/ca.pem"), "{err}");
         assert!(!err.contains("secret-token"));
+    }
+
+    #[test]
+    fn a_redirect_is_not_followed() {
+        let elsewhere = TcpListener::bind("127.0.0.1:0").unwrap();
+        elsewhere.set_nonblocking(true).unwrap();
+        let target = format!("http://{}/v1/push", elsewhere.local_addr().unwrap());
+        let store = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", store.local_addr().unwrap());
+        thread::spawn(move || {
+            let (mut c, _) = store.accept().unwrap();
+            let mut buf = [0u8; 65536];
+            let _ = c.read(&mut buf);
+            write!(
+                c,
+                "HTTP/1.1 302 Found\r\nLocation: {target}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+        });
+        let agent = agent("redirect-location", &url);
+        records(&agent, 1);
+        let mut s = sender(&agent);
+        assert_eq!(s.step(), Next::Wait(STOPPED_RETRY));
+        assert_eq!(acked(&agent), 0);
+        assert!(
+            elsewhere.accept().is_err(),
+            "the redirect target was contacted"
+        );
+    }
+
+    #[test]
+    fn a_rotated_token_is_used_after_a_401() {
+        let (url, rx) = fake_store(vec![Box::new(|_| (401, Vec::new())), Box::new(ack)]);
+        let agent = agent("rotate", &url);
+        records(&agent, 1);
+        let mut s = sender(&agent);
+        let token_file = agent.cfg.nisshi.as_ref().unwrap().token_file.clone();
+        std::fs::write(&token_file, "rotated-token\n").unwrap();
+        assert_eq!(s.step(), Next::Again, "a new token is tried at once");
+        assert_eq!(rx.recv().unwrap().0, "Authorization: Bearer secret-token");
+        s.step();
+        assert_eq!(rx.recv().unwrap().0, "Authorization: Bearer rotated-token");
+        assert_eq!(acked(&agent), 1);
+    }
+
+    #[test]
+    fn a_malformed_token_never_shows_in_errors() {
+        let agent = agent("bad-token", "https://nisshi.example.org");
+        let d = agent.cfg.nisshi.as_ref().unwrap();
+        for bad in [
+            &b"secret\nleak"[..],
+            b"secret\x01leak",
+            "secret\u{e9}leak".as_bytes(),
+            b"secret leak",
+            b"  \n",
+        ] {
+            std::fs::write(&d.token_file, bad).unwrap();
+            let err = Client::new(d).err().unwrap();
+            assert!(!err.contains("secret") && !err.contains("leak"), "{err}");
+        }
     }
 }
