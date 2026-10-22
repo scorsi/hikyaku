@@ -37,7 +37,9 @@ pub fn scrape(
                     },
                     "error",
                 ),
-                Ok(_) if body.len() > MAX_BODY_BYTES => (
+                // The cap is on the body as the record holds it, JSON-escaped (ADR 0013): a
+                // refused record must still fit its replacement.
+                Ok(_) if body.len() > MAX_BODY_BYTES || escaped_len(&body) > MAX_BODY_BYTES => (
                     ScrapeResult::Down {
                         error: "body-too-large".into(),
                     },
@@ -49,13 +51,16 @@ pub fn scrape(
                     },
                     "series-limit",
                 ),
-                Ok(_) => (
-                    ScrapeResult::Up {
-                        content_type,
-                        body: String::from_utf8_lossy(&body).into_owned(),
-                    },
-                    "ok",
-                ),
+                // Kept as received or not at all: no lossy replacement of invalid bytes.
+                Ok(_) => match String::from_utf8(body) {
+                    Ok(body) => (ScrapeResult::Up { content_type, body }, "ok"),
+                    Err(_) => (
+                        ScrapeResult::Down {
+                            error: "body-not-utf8".into(),
+                        },
+                        "error",
+                    ),
+                },
             }
         }
         Err(ureq::Error::Status(code, _)) => (
@@ -85,6 +90,17 @@ pub fn scrape(
         },
         label,
     )
+}
+
+/// The bytes `body` takes as a JSON string (quotes excluded); invalid UTF-8 counts as is.
+fn escaped_len(body: &[u8]) -> usize {
+    body.iter()
+        .map(|&c| match c {
+            b'"' | b'\\' | b'\n' | b'\r' | b'\t' | 0x08 | 0x0c => 2,
+            0..0x20 => 6,
+            _ => 1,
+        })
+        .sum()
 }
 
 /// Samples in an exposition: non-empty lines that are not comments.
@@ -168,6 +184,34 @@ mod tests {
                 error: "body-too-large".into()
             }
         );
+        // Under 2 MiB as received, over it once JSON-escaped.
+        let (s, _) = scrape(
+            &agent,
+            "svc",
+            &serve_once("200 OK", vec![b'\\'; 1_600_000]),
+            10,
+        );
+        assert_eq!(
+            s.result,
+            ScrapeResult::Down {
+                error: "body-too-large".into()
+            }
+        );
+        let (s, label) = scrape(
+            &agent,
+            "svc",
+            &serve_once("200 OK", b"a 1\xff\n".to_vec()),
+            10,
+        );
+        assert_eq!(
+            (label, s.result),
+            (
+                "error",
+                ScrapeResult::Down {
+                    error: "body-not-utf8".into()
+                }
+            )
+        );
         let (s, label) = scrape(
             &agent,
             "svc",
@@ -192,6 +236,11 @@ mod tests {
             ScrapeResult::Down {
                 error: "connection-refused".into()
             }
+        );
+        let tricky = "a\"b\\c\n\t\u{1}\u{8}\u{c}\u{7f}é";
+        assert_eq!(
+            escaped_len(tricky.as_bytes()),
+            serde_json::Value::from(tricky).to_string().len() - 2
         );
         assert_eq!(
             series(b"# HELP x\n# TYPE x gauge\nx 1\n\ny{a=\"b\"} 2\n"),

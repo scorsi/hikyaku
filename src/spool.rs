@@ -97,6 +97,10 @@ impl Pending {
     }
 
     fn check(&self, record: &str) -> Result<(), String> {
+        // Stricter than the stores: a refused record must fit in its replacement.
+        if record.len() > crate::record::MAX_REPLACEABLE_BYTES {
+            return Err("record-too-large".into());
+        }
         match self {
             Pending::Log(_) => logschema::check_record(record.as_bytes()),
             Pending::Scrape(_) => scrape_record::check(record.as_bytes()),
@@ -312,7 +316,13 @@ impl Spool {
         };
         for s in Signal::ALL {
             let st = self.state.stream(s);
-            snap.bytes[s.i()] = self.closed_bytes[s.i()] + st.open_bytes;
+            // Replacements live in state.json but count against the limit like spooled bytes.
+            let replaced: usize = self
+                .state
+                .replacements
+                .get(s.name())
+                .map_or(0, |r| r.values().map(String::len).sum());
+            snap.bytes[s.i()] = self.closed_bytes[s.i()] + st.open_bytes + replaced as u64;
             snap.paused[s.i()] = self.is_paused(s);
             snap.unacked[s.i()] = st.next_seq - 1 - st.acked_seq;
         }
@@ -514,13 +524,21 @@ impl Spool {
         self.state.replacements.get(s.name())?.get(&seq.to_string())
     }
 
-    pub fn set_replacement(&mut self, s: Signal, seq: u64, record: String) -> io::Result<()> {
+    /// Commits a replacement; its bytes count against the limit, so it may pause ingestion.
+    pub fn set_replacement(
+        &mut self,
+        s: Signal,
+        seq: u64,
+        record: String,
+    ) -> io::Result<Vec<(Signal, bool)>> {
         self.state
             .replacements
             .entry(s.name().into())
             .or_default()
             .insert(seq.to_string(), record);
-        self.write_state()
+        let transitions = self.evaluate_pause();
+        self.write_state()?;
+        Ok(transitions)
     }
 
     /// Pause at 99 % of the limit (the last 1 % is for the agent's own events), resume below
@@ -1086,6 +1104,36 @@ mod tests {
         assert_eq!(spool.snapshot().total(), 0);
         assert_eq!(fs::metadata(tmp.join("logs/open.ndjson")).unwrap().len(), 0);
         assert_eq!(spool.state.stream(Signal::Logs).next_seq, n + 1);
+    }
+
+    #[test]
+    fn replacements_count_against_the_limit() {
+        let tmp = tempdir("replacements");
+        let (mut spool, _) = Spool::open(&tmp, "node-a", 100_000).unwrap();
+        spool
+            .commit(Signal::Logs, &[event(1), event(2)], false, |_| {})
+            .unwrap();
+        let before = spool.snapshot().total();
+        assert!(
+            spool
+                .set_replacement(Signal::Logs, 1, "r".repeat(10_000))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(spool.snapshot().total(), before + 10_000);
+        // Enough replaced bytes pause ingestion like spooled ones.
+        assert_eq!(
+            spool
+                .set_replacement(Signal::Logs, 2, "r".repeat(90_000))
+                .unwrap(),
+            [(Signal::Logs, true), (Signal::Metrics, true)]
+        );
+        // Acked: dropped from the state and from the total, ingestion resumes.
+        assert_eq!(
+            spool.ack(Signal::Logs, 2).unwrap(),
+            [(Signal::Logs, false), (Signal::Metrics, false)]
+        );
+        assert_eq!(spool.snapshot().total(), 0);
     }
 
     fn tempdir(name: &str) -> PathBuf {

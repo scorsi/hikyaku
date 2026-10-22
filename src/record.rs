@@ -5,6 +5,11 @@
 use crate::logschema::{self, MAX_LINE_BYTES, MAX_RECORD_BYTES};
 use serde_json::Value;
 
+/// The largest record the agent builds: once refused, its replacement carries it in base64
+/// (4/3 of its size) plus an envelope under 4 KiB (store reason cut to 256 bytes, service name
+/// to 256), and must still fit the stores' record limit (ADR 0005, 0013).
+pub const MAX_REPLACEABLE_BYTES: usize = (MAX_RECORD_BYTES - 4096) / 4 * 3;
+
 /// `PRIORITY` → level (log-schema.md, "Wrapped lines").
 pub fn level_of_priority(p: &str) -> &'static str {
     match p {
@@ -130,7 +135,7 @@ pub fn wrap(ts: &str, level: &str, event: &str, reason: Option<&str>, msg: &[u8]
         }
         let line = service_line(ts, level, event, &fields);
         // Room for the agent's fields (node, service, stream, seq, source).
-        if line.len() + 256 <= MAX_RECORD_BYTES || limit < 1024 {
+        if line.len() + 256 <= MAX_REPLACEABLE_BYTES || limit < 1024 {
             return line;
         }
         limit /= 2;
@@ -186,7 +191,7 @@ fn refused_origin(refused: &[u8]) -> (String, String) {
         .map_or_else(crate::ts::now, str::to_string);
     let service = v["service"]
         .as_str()
-        .filter(|s| !s.is_empty())
+        .filter(|s| !s.is_empty() && s.len() <= 256)
         .unwrap_or("hikyaku")
         .to_string();
     (ts, service)
@@ -446,5 +451,46 @@ mod tests {
         assert_eq!(base64(b"{\"v\":1}"), "eyJ2IjoxfQ==");
         assert_eq!(base64(b"abc"), "YWJj");
         assert_eq!(base64(b""), "");
+    }
+
+    #[test]
+    fn every_record_fits_its_replacement() {
+        // 512 KiB of 0x01: valid UTF-8, six bytes each once JSON-escaped.
+        let control = PendingLog::from_source(&[1u8; 512 << 10], TS, "info", "svc", "file");
+        let worst = [
+            control.render("node-a", STREAM, 7),
+            PendingLog::from_source(&[b'"'; 4 << 20], TS, "info", "svc", "file")
+                .render("node-a", STREAM, 7),
+        ];
+        let reason = "x".repeat(256);
+        let service = "s".repeat(256);
+        for r in worst {
+            assert_eq!(check_record(r.as_bytes()), Ok(()));
+            assert!(r.len() <= MAX_REPLACEABLE_BYTES, "{}", r.len());
+            // The worst envelope: longest reason and service the replacement can carry.
+            let r = r.replace("\"service\":\"svc\"", &format!("\"service\":\"{service}\""));
+            let rep = rejected_log(r.as_bytes(), &reason, "node-a", STREAM, 7);
+            assert_eq!(check_record(rep.as_bytes()), Ok(()), "{}", rep.len());
+        }
+        // A scrape record at the budget gives a replacement masu accepts.
+        let body = "a".repeat(MAX_REPLACEABLE_BYTES - 600);
+        let scrape = Scrape {
+            ts: TS.into(),
+            service: service.clone(),
+            dur_us: 1,
+            result: ScrapeResult::Up {
+                content_type: "text/plain".into(),
+                body,
+            },
+        }
+        .render("node-a", STREAM, 7);
+        assert!(scrape.len() <= MAX_REPLACEABLE_BYTES);
+        let rep = rejected_scrape(scrape.as_bytes(), &reason, "node-a", STREAM, 7);
+        assert_eq!(
+            scrape_record::check(rep.as_bytes()),
+            Ok(()),
+            "{}",
+            rep.len()
+        );
     }
 }

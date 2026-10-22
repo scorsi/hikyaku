@@ -353,6 +353,7 @@ impl<'a> Sender<'a> {
                         .map(|r| (r.record_index, r.reason)),
                 };
                 let (index, reason) = rejected.unwrap_or((None, "bad-push-rejected".into()));
+                let reason = bounded(reason);
                 match index.map(|i| i as usize).filter(|&i| i < n) {
                     Some(i) => self.replace(&batch, i, reason),
                     None => self.stop("400", reason),
@@ -409,16 +410,36 @@ impl<'a> Sender<'a> {
             Signal::Logs => rejected_log(refused, &reason, &node, &stream, seq),
             Signal::Metrics => rejected_scrape(refused, &reason, &node, &stream, seq),
         };
+        // Checked before it is persisted: a record spooled before the size budget (ADR 0013)
+        // can give a replacement over the stores' limit, which would be refused in its turn.
+        let valid = match self.signal {
+            Signal::Logs => crate::logschema::check_record(record.as_bytes()),
+            Signal::Metrics => crate::scrape_record::check(record.as_bytes()),
+        };
+        if let Err(err) = valid {
+            self.event(
+                "error",
+                "replacement-rejected",
+                &[("rejected_seq", seq.into()), ("err", err.into())],
+            );
+            return Next::Wait(STOPPED_RETRY);
+        }
         let saved = self
             .agent
             .spool
             .lock()
             .unwrap()
             .set_replacement(self.signal, seq, record);
-        self.agent.after(saved.map(|()| Commit::default()));
+        self.agent.after(saved.map(|transitions| Commit {
+            transitions,
+            ..Commit::default()
+        }));
+        // The label is the reason's class ("duplicate-field", not "duplicate-field:<name>"):
+        // bounded cardinality; the event keeps the full reason.
+        let class = reason.split(':').next().unwrap_or_default();
         self.agent.metrics.inc(
             "hikyaku_rejected_records_total",
-            &[("signal", self.signal.name()), ("reason", &reason)],
+            &[("signal", self.signal.name()), ("reason", class)],
         );
         self.event(
             "error",
@@ -835,9 +856,22 @@ mod tests {
         let store = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", store.local_addr().unwrap());
         thread::spawn(move || {
-            let (mut c, _) = store.accept().unwrap();
-            let mut buf = [0u8; 65536];
-            let _ = c.read(&mut buf);
+            let (c, _) = store.accept().unwrap();
+            // The whole request is read first: closing on a body still in flight resets it.
+            let mut reader = BufReader::new(c);
+            let mut len = 0;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    len = v.trim().parse().unwrap();
+                }
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            reader.read_exact(&mut vec![0; len]).unwrap();
+            let mut c = reader.into_inner();
             write!(
                 c,
                 "HTTP/1.1 302 Found\r\nLocation: {target}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
@@ -885,5 +919,33 @@ mod tests {
             let err = Client::new(d).err().unwrap();
             assert!(!err.contains("secret") && !err.contains("leak"), "{err}");
         }
+    }
+
+    #[test]
+    fn an_oversized_legacy_record_is_not_replaced() {
+        let agent = agent("legacy", "http://127.0.0.1:9");
+        records(&agent, 1);
+        let mut s = sender(&agent);
+        // A record spooled before the size budget: its replacement would exceed 4 MiB.
+        let batch = Batch {
+            first: 1,
+            records: vec![vec![b'a'; 3_500_000]],
+            replaced: vec![false],
+            more: false,
+            body: Vec::new(),
+        };
+        assert_eq!(s.replace(&batch, 0, "x".into()), Next::Wait(STOPPED_RETRY));
+        let spool = agent.spool.lock().unwrap();
+        assert!(
+            spool.replacement(Signal::Logs, 1).is_none(),
+            "not persisted"
+        );
+        assert!(
+            spool
+                .read(Signal::Logs, 1, usize::MAX, usize::MAX)
+                .unwrap()
+                .iter()
+                .any(|r| String::from_utf8_lossy(r).contains("\"event\":\"replacement-rejected\""))
+        );
     }
 }
