@@ -164,6 +164,8 @@ pub struct Spool {
     open_first_seq: [u64; 2],
     open_since: [Instant; 2],
     closed_bytes: [u64; 2],
+    /// The spool directory, `flock`ed for the life of the spool: one agent per spool.
+    _lock: File,
 }
 
 impl Spool {
@@ -173,6 +175,16 @@ impl Spool {
         for s in Signal::ALL {
             fs::create_dir_all(dir.join(s.name()))?;
         }
+        // Before any recovery: a second agent on this spool would truncate the first one's
+        // appends that are not committed yet.
+        let lock = File::open(dir)?;
+        lock.try_lock().map_err(|e| match e {
+            fs::TryLockError::WouldBlock => io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "locked by another hikyaku process",
+            ),
+            fs::TryLockError::Error(e) => e,
+        })?;
         let _ = fs::remove_file(dir.join("state.json.tmp"));
         let (state, fresh) = match fs::read(dir.join("state.json")) {
             Ok(bytes) => (
@@ -201,7 +213,14 @@ impl Spool {
             open_first_seq: [0; 2],
             open_since: [Instant::now(); 2],
             closed_bytes: [0; 2],
+            _lock: lock,
         };
+        // The open segments (and their directories) may have just been created: their entries
+        // must be durable before a state that counts on them is.
+        for s in Signal::ALL {
+            File::open(dir.join(s.name()))?.sync_all()?;
+        }
+        File::open(dir)?.sync_all()?;
         for s in Signal::ALL {
             spool.recover(s)?;
         }
@@ -211,18 +230,10 @@ impl Spool {
     }
 
     fn recover(&mut self, s: Signal) -> io::Result<()> {
-        // 1. The open segment ends at the committed length; the rest was never acknowledged.
-        let committed = self.state.stream(s).open_bytes;
-        let len = self.open[s.i()].metadata()?.len();
-        if len != committed {
-            let keep = len.min(committed);
-            self.open[s.i()].set_len(keep)?;
-            self.open[s.i()].sync_all()?;
-            self.state.stream_mut(s).open_bytes = keep;
-        }
-        // 2. A close that was interrupted before its rename left a .tmp; after its rename, a
-        //    closed segment covering the open segment's first seq.
+        // 1. A close that was interrupted before its rename left a .tmp; a crash between the
+        //    ack's state write and the deletion left fully acked closed segments.
         let dir = self.dir.join(s.name());
+        let st = self.state.stream(s).clone();
         let mut closed_bytes = 0;
         let mut segments = Vec::new();
         for entry in fs::read_dir(&dir)? {
@@ -231,8 +242,7 @@ impl Spool {
             if name.ends_with(".tmp") {
                 fs::remove_file(entry.path())?;
             } else if let Some(range) = segment_range(&name) {
-                // A crash between the ack's state write and the deletion leaves it behind.
-                if range.1 <= self.state.stream(s).acked_seq {
+                if range.1 <= st.acked_seq {
                     fs::remove_file(entry.path())?;
                     continue;
                 }
@@ -241,6 +251,32 @@ impl Spool {
             }
         }
         self.closed_bytes[s.i()] = closed_bytes;
+        // 2. The open segment ends at the committed length; the rest was never acknowledged.
+        //    Shorter is only legitimate once its records are in a closed segment (close) or
+        //    acked (ADR 0012): anything else lost committed records, which must not be
+        //    accepted silently.
+        let committed = st.open_bytes;
+        let len = self.open[s.i()].metadata()?.len();
+        let all_acked = st.acked_seq + 1 >= st.next_seq;
+        let closed = segments.iter().any(|&(_, b)| b + 1 == st.next_seq);
+        if len < committed && !all_acked && !closed {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "{}/open.ndjson: {len} bytes, {committed} committed: records lost",
+                    s.name()
+                ),
+            ));
+        }
+        // A fully acked open segment is emptied (ADR 0012), also when the crash came between
+        // the ack's state write and the truncation.
+        let keep = if all_acked { 0 } else { len.min(committed) };
+        if len != keep {
+            self.open[s.i()].set_len(keep)?;
+            self.open[s.i()].sync_all()?;
+        }
+        self.state.stream_mut(s).open_bytes = keep;
+        // 3. After a close's rename, a closed segment covers the open segment's first seq.
         let first = self.first_open_seq(s)?;
         if segments.iter().any(|&(a, b)| a <= first && first <= b) {
             self.open[s.i()].set_len(0)?;
@@ -982,6 +1018,74 @@ mod tests {
         assert_eq!(r["event"], "unparsed");
         assert_eq!(r["level"], "error");
         assert_eq!(logschema::check_record(r.to_string().as_bytes()), Ok(()));
+    }
+
+    #[test]
+    fn second_open_is_refused_without_touching_the_spool() {
+        let tmp = tempdir("lock");
+        let (mut spool, _) = Spool::open(&tmp, "node-a", 1 << 30).unwrap();
+        spool
+            .commit(Signal::Logs, &[event(1)], false, |_| {})
+            .unwrap();
+        // The first agent appended a record and has not committed its state yet.
+        let open = tmp.join("logs/open.ndjson");
+        OpenOptions::new()
+            .append(true)
+            .open(&open)
+            .unwrap()
+            .write_all(b"{\"seq\":2}\n")
+            .unwrap();
+        let (len, state) = (
+            fs::metadata(&open).unwrap().len(),
+            fs::read(tmp.join("state.json")).unwrap(),
+        );
+        let err = Spool::open(&tmp, "node-a", 1 << 30).err().unwrap();
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock, "{err}");
+        assert_eq!(fs::metadata(&open).unwrap().len(), len);
+        assert_eq!(fs::read(tmp.join("state.json")).unwrap(), state);
+        drop(spool);
+        assert!(
+            Spool::open(&tmp, "node-a", 1 << 30).is_ok(),
+            "released on drop"
+        );
+    }
+
+    #[test]
+    fn a_lost_open_segment_is_an_error() {
+        let tmp = tempdir("lost-open");
+        let (mut spool, _) = Spool::open(&tmp, "node-a", 1 << 30).unwrap();
+        spool
+            .commit(Signal::Logs, &[event(1), event(2)], false, |_| {})
+            .unwrap();
+        spool.ack(Signal::Logs, 1).unwrap();
+        drop(spool);
+        // The state counts on bytes the open segment no longer has, unacked and not closed.
+        fs::write(tmp.join("logs/open.ndjson"), b"").unwrap();
+        let err = Spool::open(&tmp, "node-a", 1 << 30).err().unwrap();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
+        assert!(err.to_string().contains("records lost"), "{err}");
+    }
+
+    #[test]
+    fn crash_between_full_ack_and_truncation_empties_at_start() {
+        let tmp = tempdir("ack-crash");
+        let (mut spool, _) = Spool::open(&tmp, "node-a", 100_000).unwrap();
+        let mut n = 0;
+        while !spool.is_paused(Signal::Logs) {
+            n += 1;
+            spool
+                .commit(Signal::Logs, &[event(n)], false, |_| {})
+                .unwrap();
+        }
+        // The ack's state write, then the crash before the truncation.
+        spool.state.stream_mut(Signal::Logs).acked_seq = n;
+        spool.write_state().unwrap();
+        drop(spool);
+        let (spool, tr) = Spool::open(&tmp, "node-a", 100_000).unwrap();
+        assert_eq!(tr, [(Signal::Logs, false), (Signal::Metrics, false)]);
+        assert_eq!(spool.snapshot().total(), 0);
+        assert_eq!(fs::metadata(tmp.join("logs/open.ndjson")).unwrap().len(), 0);
+        assert_eq!(spool.state.stream(Signal::Logs).next_seq, n + 1);
     }
 
     fn tempdir(name: &str) -> PathBuf {

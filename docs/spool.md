@@ -38,8 +38,13 @@ Private to hikyaku (ADR 0004); documented so that a human can read a spool witho
 2. Write `state.json.tmp` (new `next_seq`, `open_bytes`, source positions), `fsync`, rename,
    `fsync` the directory.
 
-At start: truncate `open.ndjson` to `open_bytes`; anything beyond was not committed and is
-read again from its source.
+At start, the agent first takes an exclusive `flock` on the spool directory, held while it
+runs: a second agent on the same spool stops before touching any file. Then it creates the
+directories and open segments if needed and `fsync`s their directories, and truncates
+`open.ndjson` to `open_bytes`; anything beyond was not committed and is read again from its
+source. An `open.ndjson` shorter than `open_bytes` is only accepted when its records are in a
+closed segment (an interrupted close) or all acked; otherwise committed records were lost and
+the agent refuses to start rather than accept the loss silently.
 
 ## Closing a segment
 
@@ -58,4 +63,5 @@ prints the spooled record and, after it, the replacement marked with `"_replaced
 
 A closed segment whose `last_seq <= acked_seq` is deleted. An open segment whose records are
 all acked (`acked_seq + 1 >= next_seq`) is emptied in place, then `open_bytes: 0` is
-committed (ADR 0012); a crash in between is the ordinary truncation to `open_bytes` at start.
+committed (ADR 0012); a crash in between is the ordinary truncation to `open_bytes` at start,
+and an open segment found fully acked at start is emptied too.
