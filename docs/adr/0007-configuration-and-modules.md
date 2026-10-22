@@ -63,6 +63,13 @@ listens outside loopback.
 Same options minus `journald`, plus `files.<name>.path`. Root LaunchDaemon, spool
 `/var/lib/hikyaku`, credentials read from the given paths.
 
+Amended (accepted 2026-10-22, cross-review 3.4): `user` (default `"root"`) and `group`
+(default `"wheel"`) let the LaunchDaemon run as a dedicated account (`UserName`,
+`GroupName`, unset for root so an existing plist does not change). The activation script
+gives that account the spool (`/var/lib/hikyaku`, mode 0700) and `/var/log/hikyaku.log`. The
+deployment creates the account and makes every token file, CA file and declared log file
+readable by it; a log readable by root only cannot be tailed by a non-root agent.
+
 ## Consequences
 
 - A reinstalled node (impermanence) needs only the declared config and its secret: the spool

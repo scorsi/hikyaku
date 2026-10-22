@@ -1,5 +1,6 @@
-# darwinModules.default (ADR 0007): hikyaku as a root LaunchDaemon, no journald, declared
-# log files instead, credentials read from the given paths, the spool at /var/lib/hikyaku.
+# darwinModules.default (ADR 0007): hikyaku as a LaunchDaemon (root, or the account `user`
+# names), no journald, declared log files instead, credentials read from the given paths, the
+# spool at /var/lib/hikyaku.
 self:
 {
   config,
@@ -22,9 +23,29 @@ let
     // lib.optionalAttrs (d.serverName != null) { server_name = d.serverName; }
     // lib.optionalAttrs (d.caFile != null) { ca_file = d.caFile; }
   ) destinations;
+  owner = lib.escapeShellArg "${cfg.user}:${cfg.group}";
 in
 {
   imports = [ (import ./common.nix self) ];
+
+  options.services.hikyaku.user = mkOption {
+    type = types.str;
+    default = "root";
+    example = "_hikyaku";
+    description = ''
+      Account the LaunchDaemon runs as. The default keeps the root daemon; another account must
+      exist (the deployment creates it): it owns the spool `/var/lib/hikyaku` (mode 0700) and
+      `/var/log/hikyaku.log`, and must be able to read every `tokenFile`, `caFile` and
+      `files.<name>.path`.
+    '';
+  };
+
+  options.services.hikyaku.group = mkOption {
+    type = types.str;
+    default = "wheel";
+    example = "_hikyaku";
+    description = "Group of the LaunchDaemon and of its spool, with `user`.";
+  };
 
   options.services.hikyaku.files = mkOption {
     type = types.attrsOf (
@@ -66,13 +87,21 @@ in
         RunAtLoad = true;
         KeepAlive = true;
         StandardErrorPath = "/var/log/hikyaku.log";
+      }
+      # Unset for root: the plist of an existing root daemon does not change.
+      // lib.optionalAttrs (cfg.user != "root") {
+        UserName = cfg.user;
+        GroupName = cfg.group;
       };
     };
 
-    # The spool directory, root only (the daemon runs as root).
+    # The spool directory and the daemon's log, for the daemon's account only.
     system.activationScripts.postActivation.text = ''
       mkdir -p /var/lib/hikyaku
+      chown ${owner} /var/lib/hikyaku
       chmod 700 /var/lib/hikyaku
+      touch /var/log/hikyaku.log
+      chown ${owner} /var/log/hikyaku.log
     '';
   };
 }

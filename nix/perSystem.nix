@@ -34,7 +34,8 @@
         };
       };
       # The darwin module against stubs of the nix-darwin options it sets (kekkai's pattern).
-      darwinEval =
+      darwinEvalWith =
+        extra:
         let
           stub = lib.mkOption { type = lib.types.attrsOf lib.types.anything; };
         in
@@ -48,12 +49,21 @@
                 launchd.daemons = stub;
                 system.activationScripts = stub;
               };
-              config.services.hikyaku = settings // {
-                files.kekkai-node.path = "/var/log/kekkai-node.log";
-              };
+              config.services.hikyaku =
+                settings
+                // {
+                  files.kekkai-node.path = "/var/log/kekkai-node.log";
+                }
+                // extra;
             }
           ];
         }).config;
+      darwinEval = darwinEvalWith { };
+      # A dedicated account instead of root (ADR 0007, amended 2026-10-22).
+      darwinEvalUser = darwinEvalWith {
+        user = "_hikyaku";
+        group = "_hikyaku";
+      };
       # The NixOS module in a full system (aarch64-linux when this system is Darwin): the
       # drvPath forces every option and unit without building anything.
       nixosEval = inputs.nixpkgs.lib.nixosSystem {
@@ -131,8 +141,16 @@
             # nix-darwin turns `command` into ProgramArguments behind `wait4path /nix/store`.
             command = darwinEval.launchd.daemons.hikyaku.command;
             unit = nixosEval.config.systemd.services.hikyaku.serviceConfig;
+            userDaemon = darwinEvalUser.launchd.daemons.hikyaku.serviceConfig;
+            activation = darwinEval.system.activationScripts.postActivation.text;
+            userActivation = darwinEvalUser.system.activationScripts.postActivation.text;
           in
           assert daemon.KeepAlive && daemon.RunAtLoad;
+          assert !(daemon ? UserName) && !(daemon ? GroupName);
+          assert lib.hasInfix "chown root:wheel /var/lib/hikyaku" activation;
+          assert userDaemon.UserName == "_hikyaku" && userDaemon.GroupName == "_hikyaku";
+          assert lib.hasInfix "chown _hikyaku:_hikyaku /var/lib/hikyaku" userActivation;
+          assert lib.hasInfix "chmod 700 /var/lib/hikyaku" userActivation;
           assert
             command == "${lib.getExe hikyaku} run ${darwinEval.services.hikyaku.configFile}"
             && !(daemon ? ProgramArguments);
