@@ -46,13 +46,21 @@ impl Agent {
     }
 
     /// An ingestion commit; `positions` records the source position the records came from.
-    pub fn commit(&self, signal: Signal, items: &[Pending], positions: impl FnOnce(&mut State)) {
+    /// False when the spool was paused: nothing written, the source keeps its position.
+    pub fn commit(
+        &self,
+        signal: Signal,
+        items: &[Pending],
+        positions: impl FnOnce(&mut State),
+    ) -> bool {
         let result = self
             .spool
             .lock()
             .unwrap()
             .commit(signal, items, false, positions);
+        let admitted = result.as_ref().is_ok_and(|c| c.admitted);
         self.after(result);
+        admitted
     }
 
     /// Announces what a commit changed. A spool I/O error is fatal: the state on disk is
@@ -275,7 +283,10 @@ fn journald_loop(agent: &Agent) {
                 && (entry.is_none() || batch.len() >= BATCH || batch_bytes >= room)
             {
                 let cursor = last_cursor.take();
-                agent.commit(Signal::Logs, &batch, |st| st.journal_cursor = cursor);
+                if !agent.commit(Signal::Logs, &batch, |st| st.journal_cursor = cursor) {
+                    paused = true;
+                    break;
+                }
                 if gaps > 0 {
                     agent.metrics.add("hikyaku_journal_gaps_total", &[], gaps);
                 }
@@ -337,6 +348,7 @@ fn file_loop(agent: &Agent, name: &str, path: std::path::PathBuf) {
             thread::sleep(Duration::from_secs(1));
             continue;
         }
+        let before = (tail.inode, tail.offset);
         let polled = match tail.poll(BATCH) {
             Ok(p) => p,
             Err(e) => {
@@ -386,9 +398,13 @@ fn file_loop(agent: &Agent, name: &str, path: std::path::PathBuf) {
                 inode: tail.inode,
                 offset: tail.offset,
             };
-            agent.commit(Signal::Logs, &batch, |st| {
+            if !agent.commit(Signal::Logs, &batch, |st| {
                 st.files.insert(name.to_string(), pos);
-            });
+            }) {
+                // Paused since the room was read: the lines are read again after the pause.
+                (tail.inode, tail.offset) = before;
+                continue;
+            }
         }
         if !full {
             thread::sleep(Duration::from_secs(1));
@@ -426,11 +442,15 @@ fn scrape_loop(agent: &Agent, name: &str, target: &Target) {
             agent.after(result);
         } else if !paused {
             let (record, label) = scrape::scrape(&http, name, &target.url, target.max_series);
+            // A scrape that finds the spool paused when it ends is skipped like the next ones.
+            let admitted = agent.commit(Signal::Metrics, &[Pending::Scrape(record)], |_| {});
             agent.metrics.inc(
                 "hikyaku_scrapes_total",
-                &[("target", name), ("result", label)],
+                &[
+                    ("target", name),
+                    ("result", if admitted { label } else { "skipped" }),
+                ],
             );
-            agent.commit(Signal::Metrics, &[Pending::Scrape(record)], |_| {});
         }
         was_paused = paused;
         thread::sleep(target.interval.saturating_sub(start.elapsed()));

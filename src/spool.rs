@@ -135,6 +135,8 @@ impl Pending {
 /// What a commit changed besides the data: pause transitions to announce, agent bugs to log.
 #[derive(Debug, Default, PartialEq)]
 pub struct Commit {
+    /// False when ingestion was refused (spool paused): nothing written, positions unchanged.
+    pub admitted: bool,
     pub first_seq: u64,
     pub count: u64,
     /// `(signal, paused)` for every signal whose pause state flipped.
@@ -170,6 +172,17 @@ pub struct Spool {
     closed_bytes: [u64; 2],
     /// The spool directory, `flock`ed for the life of the spool: one agent per spool.
     _lock: File,
+    /// Where the sender's last read stopped inside a closed segment, so the next batch goes on
+    /// decompressing from there instead of from the segment's start.
+    drain: [Option<Cursor>; 2],
+}
+
+/// A position in a segment: the reader, the seq of its next line, a line read but not taken.
+struct Cursor {
+    segment: u64,
+    seq: u64,
+    pending: Option<Vec<u8>>,
+    reader: Box<dyn BufRead + Send>,
 }
 
 impl Spool {
@@ -218,6 +231,7 @@ impl Spool {
             open_since: [Instant::now(); 2],
             closed_bytes: [0; 2],
             _lock: lock,
+            drain: [None, None],
         };
         // The open segments (and their directories) may have just been created: their entries
         // must be durable before a state that counts on them is.
@@ -355,6 +369,12 @@ impl Spool {
             first_seq: self.state.stream(s).next_seq,
             ..Commit::default()
         };
+        // Admission is decided here, under the spool's lock: a source that checked the room
+        // earlier may find the spool paused by another one since (ADR 0004).
+        if !reserve && self.is_paused(s) {
+            return Ok(out);
+        }
+        out.admitted = true;
         let over_limit = self.snapshot().total() >= self.limit;
         let mut buf = Vec::new();
         if !(reserve && over_limit) {
@@ -446,7 +466,7 @@ impl Spool {
     /// `max_bytes` is crossed (at least one record). The bytes as spooled, without newline;
     /// replacements are applied by the sender.
     pub fn read(
-        &self,
+        &mut self,
         s: Signal,
         from: u64,
         max_bytes: usize,
@@ -466,15 +486,33 @@ impl Spool {
             bytes: 0,
         };
         for (a, b) in segments {
-            let name = format!("{a:020}-{b:020}.ndjson.zst");
-            let mut reader = BufReader::new(zstd::Decoder::new(File::open(dir.join(name))?)?);
-            if !batch.take(a, &mut reader)? {
+            let mut cur = match self.drain[s.i()].take() {
+                Some(c) if c.segment == a && c.seq <= from => c,
+                _ => {
+                    let name = format!("{a:020}-{b:020}.ndjson.zst");
+                    let reader = zstd::Decoder::new(File::open(dir.join(name))?)?;
+                    Cursor {
+                        segment: a,
+                        seq: a,
+                        pending: None,
+                        reader: Box::new(BufReader::new(reader)),
+                    }
+                }
+            };
+            if !batch.take(&mut cur)? {
+                self.drain[s.i()] = Some(cur);
                 return Ok(batch.out);
             }
         }
+        // The open segment is plain and may be emptied by a close: read afresh each time.
         let open = File::open(dir.join("open.ndjson"))?;
-        let mut reader = BufReader::new(open.take(self.state.stream(s).open_bytes));
-        batch.take(self.open_first_seq[s.i()], &mut reader)?;
+        let mut cur = Cursor {
+            segment: u64::MAX,
+            seq: self.open_first_seq[s.i()],
+            pending: None,
+            reader: Box::new(BufReader::new(open.take(self.state.stream(s).open_bytes))),
+        };
+        batch.take(&mut cur)?;
         Ok(batch.out)
     }
 
@@ -583,28 +621,34 @@ struct Batch {
 }
 
 impl Batch {
-    /// Lines of one segment whose first line has seq `first`; false once the batch is full.
-    fn take(&mut self, first: u64, reader: &mut dyn BufRead) -> io::Result<bool> {
-        let mut seq = first;
-        let mut line = Vec::new();
+    /// Lines from the cursor on; false once the batch is full, the line that did not fit kept
+    /// in the cursor for the next batch.
+    fn take(&mut self, cur: &mut Cursor) -> io::Result<bool> {
         loop {
-            line.clear();
-            if reader.read_until(b'\n', &mut line)? == 0 {
-                return Ok(true);
-            }
-            if seq >= self.from {
-                if line.last() == Some(&b'\n') {
-                    line.pop();
+            let line = match cur.pending.take() {
+                Some(line) => line,
+                None => {
+                    let mut line = Vec::new();
+                    if cur.reader.read_until(b'\n', &mut line)? == 0 {
+                        return Ok(true);
+                    }
+                    if line.last() == Some(&b'\n') {
+                        line.pop();
+                    }
+                    line
                 }
+            };
+            if cur.seq >= self.from {
                 if self.out.len() >= self.max_records
                     || (!self.out.is_empty() && self.bytes + line.len() > self.max_bytes)
                 {
+                    cur.pending = Some(line);
                     return Ok(false);
                 }
                 self.bytes += line.len();
-                self.out.push(line.clone());
+                self.out.push(line);
             }
-            seq += 1;
+            cur.seq += 1;
         }
     }
 }
@@ -860,7 +904,7 @@ mod tests {
         spool.state.stream_mut(Signal::Logs).acked_seq = 4;
         spool.write_state().unwrap();
         drop(spool);
-        let (spool, _) = Spool::open(&tmp, "node-a", 1 << 30).unwrap();
+        let (mut spool, _) = Spool::open(&tmp, "node-a", 1 << 30).unwrap();
         assert_eq!(spool.snapshot().bytes[0], 0);
         assert!(
             spool
@@ -1134,6 +1178,74 @@ mod tests {
             [(Signal::Logs, false), (Signal::Metrics, false)]
         );
         assert_eq!(spool.snapshot().total(), 0);
+    }
+
+    #[test]
+    fn a_paused_spool_refuses_ingestion_under_its_lock() {
+        let tmp = tempdir("admission");
+        let (mut spool, _) = Spool::open(&tmp, "node-a", 100_000).unwrap();
+        // Two sources sized their batches against the same room; the first one fills it.
+        let room = spool.room();
+        let mut first = Vec::new();
+        let mut bytes = 0;
+        while bytes <= room {
+            let p = line(first.len() as u64);
+            bytes += p.render("node-a", &"0".repeat(32), 1).len() as u64 + 1;
+            first.push(Pending::Log(p));
+        }
+        let second = [Pending::Log(line(0))];
+        let c = spool
+            .commit(Signal::Logs, &first, false, |st| {
+                st.journal_cursor = Some("a".into())
+            })
+            .unwrap();
+        assert!(c.admitted && spool.is_paused(Signal::Logs));
+        let total = spool.snapshot().total();
+        let c = spool
+            .commit(Signal::Logs, &second, false, |st| {
+                st.journal_cursor = Some("b".into())
+            })
+            .unwrap();
+        assert!(!c.admitted && c.count == 0);
+        assert_eq!(
+            spool.state.journal_cursor.as_deref(),
+            Some("a"),
+            "position kept"
+        );
+        assert_eq!(spool.snapshot().total(), total);
+        // The reserve is untouched: own events still fit.
+        assert!(total < spool.limit);
+        let c = spool
+            .commit(Signal::Logs, &[event(1)], true, |_| {})
+            .unwrap();
+        assert!(c.admitted && c.count == 1);
+    }
+
+    #[test]
+    fn draining_a_closed_segment_goes_on_where_it_stopped() {
+        let tmp = tempdir("drain");
+        let (mut spool, _) = Spool::open(&tmp, "node-a", 1 << 30).unwrap();
+        let items: Vec<Pending> = (1..=10).map(event).collect();
+        spool.commit(Signal::Logs, &items, false, |_| {}).unwrap();
+        spool.close(Signal::Logs).unwrap();
+        let mut read = |from| -> Vec<u64> {
+            spool
+                .read(Signal::Logs, from, 1 << 20, 3)
+                .unwrap()
+                .iter()
+                .map(|r| seq_of(std::str::from_utf8(r).unwrap()).unwrap())
+                .collect()
+        };
+        assert_eq!(read(1), [1, 2, 3]);
+        assert_eq!(read(1), [1, 2, 3], "a resend reads the segment again");
+        assert_eq!(read(4), [4, 5, 6]);
+        // The next batch comes from the kept reader, not from the segment's start: garbage
+        // renamed over the segment's name is never opened.
+        let seg = tmp.join(format!("logs/{:020}-{:020}.ndjson.zst", 1, 10));
+        fs::write(tmp.join("garbage"), b"not zstd").unwrap();
+        fs::rename(tmp.join("garbage"), seg).unwrap();
+        assert_eq!(read(7), [7, 8, 9]);
+        assert_eq!(read(10), [10]);
     }
 
     fn tempdir(name: &str) -> PathBuf {

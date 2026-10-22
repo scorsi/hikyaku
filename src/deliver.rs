@@ -217,7 +217,7 @@ impl<'a> Sender<'a> {
 
     /// The spool lock is held while reading, never while sending or logging.
     fn batch(&self) -> std::io::Result<Option<Batch>> {
-        let spool = self.agent.spool.lock().unwrap();
+        let mut spool = self.agent.spool.lock().unwrap();
         let st = spool.state.stream(self.signal);
         let (first, next_seq, stream) = (st.acked_seq + 1, st.next_seq, st.stream.clone());
         if first >= next_seq {
@@ -935,7 +935,7 @@ mod tests {
             body: Vec::new(),
         };
         assert_eq!(s.replace(&batch, 0, "x".into()), Next::Wait(STOPPED_RETRY));
-        let spool = agent.spool.lock().unwrap();
+        let mut spool = agent.spool.lock().unwrap();
         assert!(
             spool.replacement(Signal::Logs, 1).is_none(),
             "not persisted"
