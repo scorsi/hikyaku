@@ -128,10 +128,14 @@
         modules-eval =
           let
             daemon = darwinEval.launchd.daemons.hikyaku.serviceConfig;
+            # nix-darwin turns `command` into ProgramArguments behind `wait4path /nix/store`.
+            command = darwinEval.launchd.daemons.hikyaku.command;
             unit = nixosEval.config.systemd.services.hikyaku.serviceConfig;
           in
           assert daemon.KeepAlive && daemon.RunAtLoad;
-          assert lib.head daemon.ProgramArguments == lib.getExe hikyaku;
+          assert
+            command == "${lib.getExe hikyaku} run ${darwinEval.services.hikyaku.configFile}"
+            && !(daemon ? ProgramArguments);
           assert unit.MemoryMax == "64M" && unit.Type == "notify" && unit.Restart == "always";
           assert lib.elem "systemd-journal-flush.service" nixosEval.config.systemd.services.hikyaku.after;
           assert

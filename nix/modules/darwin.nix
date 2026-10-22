@@ -52,16 +52,21 @@ in
 
     environment.systemPackages = [ cfg.package ];
 
-    launchd.daemons.hikyaku.serviceConfig = {
-      Label = "org.nixos.hikyaku";
-      ProgramArguments = [
+    launchd.daemons.hikyaku = {
+      # `command`, not ProgramArguments: nix-darwin wraps it in `wait4path /nix/store`. launchd
+      # starts boot jobs before the Nix volume is mounted, and a missing program exits 78
+      # (EX_CONFIG) and is never retried, KeepAlive or not.
+      command = lib.escapeShellArgs [
         (lib.getExe cfg.package)
         "run"
         "${cfg.configFile}"
       ];
-      RunAtLoad = true;
-      KeepAlive = true;
-      StandardErrorPath = "/var/log/hikyaku.log";
+      serviceConfig = {
+        Label = "org.nixos.hikyaku";
+        RunAtLoad = true;
+        KeepAlive = true;
+        StandardErrorPath = "/var/log/hikyaku.log";
+      };
     };
 
     # The spool directory, root only (the daemon runs as root).
