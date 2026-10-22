@@ -84,7 +84,10 @@ pub fn parse_duration(s: &str) -> Option<Duration> {
         "h" => 3600,
         _ => return None,
     };
-    (n > 0).then(|| Duration::from_secs(n * mult))
+    // checked: an overflow would wrap to a zero interval (a scrape loop without pause).
+    (n > 0)
+        .then(|| n.checked_mul(mult))?
+        .map(Duration::from_secs)
 }
 
 impl Config {
@@ -181,5 +184,19 @@ mod tests {
         assert_eq!(parse_duration("2m"), Some(Duration::from_secs(120)));
         assert_eq!(parse_duration("0s"), None);
         assert_eq!(parse_duration("30"), None);
+        // Limits: the largest value of each unit, and one past it.
+        assert_eq!(
+            parse_duration(&format!("{}s", u64::MAX)),
+            Some(Duration::from_secs(u64::MAX))
+        );
+        for unit in [("m", 60), ("h", 3600)] {
+            let max = u64::MAX / unit.1;
+            assert_eq!(
+                parse_duration(&format!("{max}{}", unit.0)),
+                Some(Duration::from_secs(max * unit.1))
+            );
+            assert_eq!(parse_duration(&format!("{}{}", max + 1, unit.0)), None);
+        }
+        assert_eq!(parse_duration("4611686018427387904m"), None);
     }
 }

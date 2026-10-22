@@ -35,7 +35,8 @@ pub fn from_unix(secs: i64, nanos: u32) -> String {
     )
 }
 
-/// Unix nanoseconds of a valid timestamp (days_from_civil, Howard Hinnant).
+/// Unix nanoseconds of a valid timestamp (days_from_civil, Howard Hinnant); `None` outside
+/// what an `i64` holds (about 1677 to 2262), though the schema accepts years 0000 to 9999.
 pub fn to_unix_nanos(s: &str) -> Option<i64> {
     if !is_timestamp(s) {
         return None;
@@ -49,7 +50,9 @@ pub fn to_unix_nanos(s: &str) -> Option<i64> {
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     let days = era * 146_097 + doe - 719_468;
     let secs = days * 86_400 + n(11, 13)? * 3600 + n(14, 16)? * 60 + n(17, 19)?;
-    Some(secs * 1_000_000_000 + n(20, 29)?)
+    (secs as i128 * 1_000_000_000 + n(20, 29)? as i128)
+        .try_into()
+        .ok()
 }
 
 /// `2026-10-19T08:14:00.000213904Z`: shape, then a real UTC date and time.
@@ -134,6 +137,19 @@ mod tests {
             Some("2028-02-29T23:59:59.999999999Z".to_string())
         );
         assert_eq!(to_unix_nanos("x"), None);
+        // Valid timestamps outside the i64 nanosecond range, and its exact limits.
+        assert_eq!(to_unix_nanos("2300-01-01T00:00:00.000000000Z"), None);
+        assert_eq!(to_unix_nanos("1600-01-01T00:00:00.000000000Z"), None);
+        assert_eq!(
+            to_unix_nanos("2262-04-11T23:47:16.854775807Z"),
+            Some(i64::MAX)
+        );
+        assert_eq!(to_unix_nanos("2262-04-11T23:47:16.854775808Z"), None);
+        assert_eq!(
+            to_unix_nanos("1677-09-21T00:12:43.145224192Z"),
+            Some(i64::MIN)
+        );
+        assert_eq!(to_unix_nanos("1677-09-21T00:12:43.145224191Z"), None);
         assert!(is_timestamp("2028-02-29T23:59:59.999999999Z"));
         for bad in [
             "2026-10-19T08:14:00.000213Z",
