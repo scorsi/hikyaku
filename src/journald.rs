@@ -11,6 +11,10 @@ use std::process::{Child, Command, Stdio};
 /// limit. Verified by a nixosTest against the deployed systemd, not trusted from here.
 pub const SUPPRESSED_MESSAGE_ID: &str = "a596d6fe7bfa4994828e72309e95d61e";
 
+/// The longest `journalctl -o json` line kept: a 1 MiB message printed as an array of byte
+/// values. A longer entry is cut there and kept as `unparsed` (ADR 0002's memory budget).
+pub const MAX_JSON_BYTES: usize = 4 << 20;
+
 /// The agent's own unit: its lines are already in the stream as own events.
 pub const OWN_UNIT: &str = "hikyaku";
 
@@ -71,6 +75,9 @@ fn args(cursor: Option<&str>) -> Vec<String> {
 /// One line of `journalctl -o json`. Fields journald could not print as UTF-8 strings come as
 /// arrays of byte values; `--all` keeps the long ones.
 pub fn parse_entry(line: &[u8]) -> Option<Entry> {
+    if line.len() > MAX_JSON_BYTES {
+        return cut_entry(line);
+    }
     let v: Value = serde_json::from_slice(line).ok()?;
     let text = |name: &str| v.get(name).and_then(Value::as_str).map(str::to_string);
     let unit = text("_SYSTEMD_UNIT")
@@ -90,6 +97,30 @@ pub fn parse_entry(line: &[u8]) -> Option<Entry> {
         message_id: text("MESSAGE_ID"),
         from_journald: text("_TRANSPORT").as_deref() == Some("driver")
             || text("_SYSTEMD_UNIT").as_deref() == Some("systemd-journald.service"),
+    })
+}
+
+/// An entry cut at `MAX_JSON_BYTES`: journalctl prints `__CURSOR` and
+/// `__REALTIME_TIMESTAMP` first, so the position survives; the cut JSON itself becomes the
+/// message (wrapped `unparsed`, `truncated`), so the entry is visible, not dropped.
+fn cut_entry(line: &[u8]) -> Option<Entry> {
+    let text = String::from_utf8_lossy(&line[..line.len().min(4096)]);
+    let field = |name: &str| {
+        let rest = &text[text.find(&format!("\"{name}\":\""))? + name.len() + 4..];
+        Some(rest[..rest.find('"')?].to_string())
+    };
+    Some(Entry {
+        cursor: field("__CURSOR")?,
+        realtime_us: field("__REALTIME_TIMESTAMP")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(now_us),
+        unit: field("_SYSTEMD_UNIT")
+            .map(|u| u.strip_suffix(".service").unwrap_or(&u).to_string())
+            .unwrap_or_else(|| "journald".into()),
+        priority: String::new(),
+        message: line.to_vec(),
+        message_id: None,
+        from_journald: false,
     })
 }
 
@@ -228,6 +259,23 @@ mod tests {
             Item::Suppressed { .. }
         ));
         assert!(parse_entry(b"not json").is_none());
+    }
+
+    #[test]
+    fn an_entry_over_the_cut_is_kept_unparsed() {
+        let mut line = SSHD.replace(
+            "\"MESSAGE\":\"Accepted",
+            &format!("\"MESSAGE\":\"{}", "y".repeat(MAX_JSON_BYTES)),
+        );
+        line.truncate(MAX_JSON_BYTES + 1);
+        let e = parse_entry(line.as_bytes()).unwrap();
+        assert_eq!(e.cursor, "s=6b7a;i=1a2;b=9f;m=2d6e;t=65e5c0b2a8f04;x=1");
+        assert_eq!((e.realtime_us, e.unit.as_str()), (1792397643512004, "sshd"));
+        let r = record(classify(&e));
+        assert_eq!(
+            (r["event"].as_str(), r["truncated"].as_bool()),
+            (Some("unparsed"), Some(true))
+        );
     }
 
     #[test]

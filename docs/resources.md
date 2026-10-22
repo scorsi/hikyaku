@@ -32,6 +32,10 @@ While connected the spool holds seconds of data: an open segment is emptied once
 
 - `hikyaku` ≈ 5–15 MiB RSS plus the `journalctl` child (≈ 5–10 MiB) and ≈ 20 MiB while a segment is compressed; unit `MemoryMax=64M`,
   until journald is read directly (ADR 0002).
+- Buffers are bounded in bytes, not only in lines: a file poll reads at most 4 MiB and keeps
+  at most 1 MiB + 1 byte of a line; a `journalctl` JSON line is cut at 4 MiB (kept as
+  `unparsed`); the journald channel and a journald batch hold at most 4 MiB each; a push
+  batch is at most 4 MiB of records. Worst case not yet measured under the 64 MiB cgroup.
 - Compression of a closed 16 MiB segment: well under a second, once per segment.
 - CPU below 1 % of one core on average.
 

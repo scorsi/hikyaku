@@ -1,6 +1,7 @@
 //! Declared log files (ADR 0003, macOS): tailed by inode and offset, both saved in the spool
 //! state. A file that shrinks or changes inode is read again from 0 (`file-truncated`).
 
+use crate::logschema::MAX_LINE_BYTES;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Seek, SeekFrom};
 use std::os::unix::fs::MetadataExt;
@@ -63,21 +64,45 @@ impl Tail {
     }
 }
 
-/// Up to `limit` complete lines (without their newline) and the bytes they took; an error
-/// drops them all, so that the caller's position stays where it was.
+/// Bytes a poll reads at most (ADR 0002's memory budget, `MemoryMax=64M`).
+const POLL_BYTES: u64 = 4 << 20;
+
+/// Up to `limit` complete lines (without their newline, each cut to one byte over the schema's
+/// line limit) and the bytes they took, at most about `POLL_BYTES`; an error drops them all,
+/// so that the caller's position stays where it was.
 fn read_lines(reader: &mut impl BufRead, limit: usize) -> io::Result<(Vec<Vec<u8>>, u64)> {
     let (mut lines, mut read) = (Vec::new(), 0);
-    while lines.len() < limit {
-        let mut line = Vec::new();
-        let n = reader.read_until(b'\n', &mut line)?;
-        if n == 0 || line.last() != Some(&b'\n') {
+    while lines.len() < limit && read < POLL_BYTES {
+        let Some((line, n)) = read_line_bounded(reader, MAX_LINE_BYTES + 1)? else {
             break;
-        }
-        read += n as u64;
-        line.pop();
+        };
+        read += n;
         lines.push(line);
     }
     Ok((lines, read))
+}
+
+/// One complete line without its newline, and the bytes it took. At most `keep` bytes are
+/// kept: the rest of a longer line is read and dropped, never held in memory. `None` when the
+/// input ends before a newline.
+pub fn read_line_bounded(r: &mut impl BufRead, keep: usize) -> io::Result<Option<(Vec<u8>, u64)>> {
+    let (mut line, mut used) = (Vec::new(), 0u64);
+    loop {
+        let buf = r.fill_buf()?;
+        if buf.is_empty() {
+            return Ok(None);
+        }
+        let newline = buf.iter().position(|&c| c == b'\n');
+        let chunk = &buf[..newline.unwrap_or(buf.len())];
+        let room = keep.saturating_sub(line.len()).min(chunk.len());
+        line.extend_from_slice(&chunk[..room]);
+        let n = newline.map_or(buf.len(), |i| i + 1);
+        r.consume(n);
+        used += n as u64;
+        if newline.is_some() {
+            return Ok(Some((line, used)));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -151,5 +176,25 @@ mod tests {
         // not moved and the line is read again.
         let mut failing = BufReader::with_capacity(4, FailAfter(b"one\ntwo"));
         assert!(read_lines(&mut failing, 10).is_err());
+    }
+
+    #[test]
+    fn long_lines_are_cut_while_read() {
+        let mut long = vec![b'x'; 3 * MAX_LINE_BYTES];
+        long.extend_from_slice(b"\nnext\nno-newline");
+        let mut r = BufReader::with_capacity(4096, &long[..]);
+        let (lines, read) = read_lines(&mut r, 10).unwrap();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(
+            lines[0].len(),
+            MAX_LINE_BYTES + 1,
+            "kept up to the limit only"
+        );
+        assert_eq!(lines[1], b"next");
+        assert_eq!(
+            read,
+            3 * MAX_LINE_BYTES as u64 + 6,
+            "the whole line is consumed"
+        );
     }
 }

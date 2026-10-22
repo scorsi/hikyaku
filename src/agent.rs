@@ -8,11 +8,12 @@ use crate::journald::{self, Item};
 use crate::metrics::{self, Metrics};
 use crate::record::{PendingLog, Scrape, ScrapeResult};
 use crate::spool::{Commit, FilePos, Pending, Signal, Spool, State};
-use crate::{deliver, scrape, ts};
+use crate::{deliver, files, scrape, ts};
 use serde_json::Value;
-use std::io::{self, BufRead, BufReader};
+use std::io::{self, BufReader};
 use std::net::TcpListener;
 use std::os::unix::net::UnixDatagram;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{RecvTimeoutError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -23,6 +24,10 @@ const TICK: Duration = Duration::from_secs(10);
 /// journald and file lines are committed in batches: up to this many, or whatever arrived
 /// within the wait.
 const BATCH: usize = 1000;
+/// ... and up to this many bytes, with as many again waiting in the journald channel (ADR
+/// 0002's memory budget: `MemoryMax=64M` also holds journalctl and the zstd encoder).
+const BATCH_BYTES: u64 = 4 << 20;
+const CHANNEL_BYTES: usize = 4 << 20;
 const BATCH_WAIT: Duration = Duration::from_millis(100);
 const RETRY: Duration = Duration::from_secs(5);
 
@@ -203,24 +208,34 @@ fn journald_loop(agent: &Agent) {
             }
         };
         let stdout = child.stdout.take().expect("piped stdout");
-        let (tx, rx) = sync_channel::<journald::Entry>(4 * BATCH);
-        let reader = thread::spawn(move || {
-            let mut reader = BufReader::new(stdout);
-            let mut line = Vec::new();
-            loop {
-                line.clear();
-                match reader.read_until(b'\n', &mut line) {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) => {
-                        if let Some(e) = journald::parse_entry(&line)
-                            && tx.send(e).is_err()
-                        {
-                            break;
+        // Bounded in bytes, not only in entries (`MemoryMax=64M`): the reader waits while the
+        // entries in the channel hold more than `CHANNEL_BYTES`.
+        let (tx, rx) = sync_channel::<(journald::Entry, usize)>(4 * BATCH);
+        let queued = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let reader = {
+            let (queued, stop) = (queued.clone(), stop.clone());
+            thread::spawn(move || {
+                let mut reader = BufReader::new(stdout);
+                while let Ok(Some((line, _))) =
+                    files::read_line_bounded(&mut reader, journald::MAX_JSON_BYTES + 1)
+                {
+                    let Some(e) = journald::parse_entry(&line) else {
+                        continue;
+                    };
+                    while queued.load(Ordering::Acquire) > CHANNEL_BYTES {
+                        if stop.load(Ordering::Acquire) {
+                            return;
                         }
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    queued.fetch_add(line.len(), Ordering::AcqRel);
+                    if tx.send((e, line.len())).is_err() {
+                        break;
                     }
                 }
-            }
-        });
+            })
+        };
 
         // With a saved cursor, the first entry is the one already spooled: anything else means
         // journald rotated past the cursor while the agent was paused or stopped.
@@ -240,7 +255,10 @@ fn journald_loop(agent: &Agent) {
             }
             let room = agent.spool.lock().unwrap().room();
             let entry = match rx.recv_timeout(BATCH_WAIT) {
-                Ok(e) => Some(e),
+                Ok((e, len)) => {
+                    queued.fetch_sub(len, Ordering::AcqRel);
+                    Some(e)
+                }
                 Err(RecvTimeoutError::Timeout) => None,
                 Err(RecvTimeoutError::Disconnected) => break,
             };
@@ -280,7 +298,10 @@ fn journald_loop(agent: &Agent) {
             }
             batch_bytes += estimate(agent, &batch[pushed..]);
             if last_cursor.is_some()
-                && (entry.is_none() || batch.len() >= BATCH || batch_bytes >= room)
+                && (entry.is_none()
+                    || batch.len() >= BATCH
+                    || batch_bytes >= room
+                    || batch_bytes >= BATCH_BYTES)
             {
                 let cursor = last_cursor.take();
                 if !agent.commit(Signal::Logs, &batch, |st| st.journal_cursor = cursor) {
@@ -300,6 +321,7 @@ fn journald_loop(agent: &Agent) {
             }
         }
         // The uncommitted batch is dropped: the next child reads it again from the cursor.
+        stop.store(true, Ordering::Release);
         drop(rx);
         let _ = child.kill();
         let _ = child.wait();
