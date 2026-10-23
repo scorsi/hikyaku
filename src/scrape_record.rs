@@ -24,6 +24,11 @@ pub fn check(b: &[u8]) -> Result<(), String> {
         return Err("framing".into());
     }
     let obj = json::parse(b)?;
+    // masu parses with serde_json, stricter than the shared scanner the log path keeps (nisshi):
+    // a number out of its range or a lone surrogate is `not-json` there.
+    if serde_json::from_slice::<Value>(b).is_err() {
+        return Err("not-json".into());
+    }
     if let Some(name) = obj.first_duplicate() {
         return Err(format!("duplicate-field:{name}"));
     }
@@ -57,4 +62,25 @@ pub fn check(b: &[u8]) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn what_serde_json_refuses_is_not_json() {
+        let rec = |extra: &str| {
+            format!(
+                r#"{{"v":1,"ts":"2026-10-19T08:14:00.000213904Z","node":"a","service":"","stream":"{}","seq":0,"up":false,"dur_us":0,"error":"","extra":{extra}}}"#,
+                "0".repeat(32)
+            )
+        };
+        assert_eq!(check(rec("1e10").as_bytes()), Ok(()));
+        assert_eq!(check(rec("1e10000").as_bytes()), Err("not-json".into()));
+        assert_eq!(check(rec(r#""\ud800""#).as_bytes()), Err("not-json".into()));
+        // The log path keeps both forms, as nisshi does.
+        assert!(json::parse(rec("1e10000").as_bytes()).is_ok());
+        assert!(json::parse(rec(r#""\ud800""#).as_bytes()).is_ok());
+    }
 }

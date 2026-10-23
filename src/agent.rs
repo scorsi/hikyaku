@@ -408,11 +408,7 @@ fn file_loop(agent: &Agent, name: &str, path: std::path::PathBuf) {
             taken += 1;
         }
         // Lines beyond the room are read again after the pause (their offset is not saved).
-        let rest: u64 = polled.lines[taken..]
-            .iter()
-            .map(|l| l.len() as u64 + 1)
-            .sum();
-        tail.offset -= rest;
+        let rest = tail.defer(&polled, taken);
         let full = polled.lines.len() >= BATCH || rest > 0;
         if !batch.is_empty() {
             let pos = FilePos {

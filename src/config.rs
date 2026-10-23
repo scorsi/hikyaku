@@ -129,6 +129,10 @@ impl Config {
             }
         }
         for (name, f) in &self.files {
+            // The name is the records' `service`, which nisshi refuses empty (`service-format`).
+            if name.is_empty() {
+                return Err("files: an input name must not be empty".into());
+            }
             if !f.path.is_absolute() {
                 return Err(format!("files.{name}.path: must be absolute"));
             }
@@ -198,5 +202,12 @@ mod tests {
             assert_eq!(parse_duration(&format!("{}{}", max + 1, unit.0)), None);
         }
         assert_eq!(parse_duration("4611686018427387904m"), None);
+    }
+    #[test]
+    fn an_empty_input_name_is_refused() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/config");
+        assert!(Config::load(&dir.join("valid.toml")).is_ok());
+        let err = Config::load(&dir.join("empty-input-name.toml")).unwrap_err();
+        assert!(err.contains("must not be empty"), "{err}");
     }
 }

@@ -95,10 +95,11 @@ in
       };
     };
 
-    # The spool directory and the daemon's log, for the daemon's account only.
+    # The spool directory and the daemon's log, for the daemon's account only. The whole tree:
+    # a spool a root daemon wrote stays usable after a move to `user` (its launchd retries).
     system.activationScripts.postActivation.text = ''
       mkdir -p /var/lib/hikyaku
-      chown ${owner} /var/lib/hikyaku
+      chown -R ${owner} /var/lib/hikyaku
       chmod 700 /var/lib/hikyaku
       touch /var/log/hikyaku.log
       chown ${owner} /var/log/hikyaku.log

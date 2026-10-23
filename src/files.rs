@@ -16,6 +16,8 @@ pub struct Tail {
 pub struct Polled {
     /// Complete lines, without their newline.
     pub lines: Vec<Vec<u8>>,
+    /// Bytes each line took in the file, newline included (a long line is cut in `lines`).
+    pub used: Vec<u64>,
     pub truncated: bool,
 }
 
@@ -26,6 +28,7 @@ impl Tail {
     pub fn poll(&mut self, limit: usize) -> io::Result<Polled> {
         let mut out = Polled {
             lines: Vec::new(),
+            used: Vec::new(),
             truncated: false,
         };
         // The path is looked at without following a link, then the bytes and the size come
@@ -57,10 +60,18 @@ impl Tail {
         }
         let mut reader = BufReader::new(f);
         reader.seek(SeekFrom::Start(offset))?;
-        let (lines, read) = read_lines(&mut reader, limit)?;
-        out.lines = lines;
-        (self.inode, self.offset) = (meta.ino(), offset + read);
+        (out.lines, out.used) = read_lines(&mut reader, limit)?;
+        (self.inode, self.offset) = (meta.ino(), offset + out.used.iter().sum::<u64>());
         Ok(out)
+    }
+
+    /// Moves the position back to the start of `polled.lines[taken]`, so that the lines past it
+    /// are read again at the next poll; returns the bytes given back. It counts the bytes the
+    /// lines took in the file, not the ones kept, or a cut long line would resume mid-way.
+    pub fn defer(&mut self, polled: &Polled, taken: usize) -> u64 {
+        let rest: u64 = polled.used[taken..].iter().sum();
+        self.offset -= rest;
+        rest
     }
 }
 
@@ -68,18 +79,19 @@ impl Tail {
 const POLL_BYTES: u64 = 4 << 20;
 
 /// Up to `limit` complete lines (without their newline, each cut to one byte over the schema's
-/// line limit) and the bytes they took, at most about `POLL_BYTES`; an error drops them all,
+/// line limit) and the bytes each took, at most about `POLL_BYTES`; an error drops them all,
 /// so that the caller's position stays where it was.
-fn read_lines(reader: &mut impl BufRead, limit: usize) -> io::Result<(Vec<Vec<u8>>, u64)> {
-    let (mut lines, mut read) = (Vec::new(), 0);
+fn read_lines(reader: &mut impl BufRead, limit: usize) -> io::Result<(Vec<Vec<u8>>, Vec<u64>)> {
+    let (mut lines, mut used, mut read) = (Vec::new(), Vec::new(), 0);
     while lines.len() < limit && read < POLL_BYTES {
         let Some((line, n)) = read_line_bounded(reader, MAX_LINE_BYTES + 1)? else {
             break;
         };
         read += n;
         lines.push(line);
+        used.push(n);
     }
-    Ok((lines, read))
+    Ok((lines, used))
 }
 
 /// One complete line without its newline, and the bytes it took. At most `keep` bytes are
@@ -171,7 +183,7 @@ mod tests {
     #[test]
     fn a_read_error_keeps_the_lines_for_the_next_poll() {
         let mut ok = BufReader::new(&b"one\ntwo\npart"[..]);
-        assert_eq!(read_lines(&mut ok, 10).unwrap().1, 8);
+        assert_eq!(read_lines(&mut ok, 10).unwrap().1, [4, 4]);
         // One complete line read, then an error: nothing is returned, so the tail's offset is
         // not moved and the line is read again.
         let mut failing = BufReader::with_capacity(4, FailAfter(b"one\ntwo"));
@@ -183,7 +195,7 @@ mod tests {
         let mut long = vec![b'x'; 3 * MAX_LINE_BYTES];
         long.extend_from_slice(b"\nnext\nno-newline");
         let mut r = BufReader::with_capacity(4096, &long[..]);
-        let (lines, read) = read_lines(&mut r, 10).unwrap();
+        let (lines, used) = read_lines(&mut r, 10).unwrap();
         assert_eq!(lines.len(), 2);
         assert_eq!(
             lines[0].len(),
@@ -192,9 +204,37 @@ mod tests {
         );
         assert_eq!(lines[1], b"next");
         assert_eq!(
-            read,
-            3 * MAX_LINE_BYTES as u64 + 6,
+            used,
+            [3 * MAX_LINE_BYTES as u64 + 1, 5],
             "the whole line is consumed"
         );
+    }
+
+    #[test]
+    fn a_deferred_long_line_is_read_again_from_its_start() {
+        let dir = std::env::temp_dir().join(format!("hikyaku-defer-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("svc.log");
+        let mut content = b"ok\n".to_vec();
+        content.extend(vec![b'x'; 3 * MAX_LINE_BYTES]);
+        content.push(b'\n');
+        fs::write(&path, &content).unwrap();
+        let mut tail = Tail {
+            path: path.clone(),
+            inode: 0,
+            offset: 0,
+        };
+        let p = tail.poll(1000).unwrap();
+        assert_eq!(p.lines.len(), 2);
+        assert_eq!(tail.offset, content.len() as u64);
+        // Room for `ok` only, as `file_loop` when the batch is full: the long line is deferred.
+        assert_eq!(tail.defer(&p, 1), 3 * MAX_LINE_BYTES as u64 + 1);
+        assert_eq!(tail.offset, 3, "saved at the start of the long line");
+        let again = tail.poll(1000).unwrap();
+        assert_eq!(again.lines.len(), 1);
+        assert_eq!(again.lines[0].len(), MAX_LINE_BYTES + 1);
+        assert_eq!(tail.offset, content.len() as u64);
+        let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -119,7 +119,10 @@ impl Pending {
                     Some(reason),
                     record.as_bytes(),
                 ),
-                service: l.service.clone(),
+                // The service is kept unless it is itself the refused field.
+                service: Some(l.service.clone())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "hikyaku".into()),
                 source: l.source,
             }),
             Pending::Scrape(s) => Pending::Scrape(Scrape {

@@ -147,9 +147,9 @@
           in
           assert daemon.KeepAlive && daemon.RunAtLoad;
           assert !(daemon ? UserName) && !(daemon ? GroupName);
-          assert lib.hasInfix "chown root:wheel /var/lib/hikyaku" activation;
+          assert lib.hasInfix "chown -R root:wheel /var/lib/hikyaku" activation;
           assert userDaemon.UserName == "_hikyaku" && userDaemon.GroupName == "_hikyaku";
-          assert lib.hasInfix "chown _hikyaku:_hikyaku /var/lib/hikyaku" userActivation;
+          assert lib.hasInfix "chown -R _hikyaku:_hikyaku /var/lib/hikyaku" userActivation;
           assert lib.hasInfix "chmod 700 /var/lib/hikyaku" userActivation;
           assert
             command == "${lib.getExe hikyaku} run ${darwinEval.services.hikyaku.configFile}"

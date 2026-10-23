@@ -41,8 +41,9 @@ implementations must cost one record, not a stream.
 | 200 `acked_seq` | advance `acked_seq`, delete closed segments fully acked |
 | 413 | halve the batch, retry at once (minimum one record; a single record over the limit is an agent bug, logged at `error`) |
 | 400 with `record_index` | replace that record (below), resend at once |
-| 400 without `record_index`, 401 | stop sending that stream, `error` event and counter, retry every 5 minutes: a request-level 400 (node, stream id) or an authentication failure is a config or agent bug that no replacement can fix |
-| 507, other 5xx, network error, timeout (30 s) | exponential backoff 1 s → 5 min, with jitter |
+| 401 | read the token file again: another valid token, resend at once with it; the same one or an unreadable file, stop as below |
+| 400 without `record_index`, 401 with the same token, 403, other 4xx | stop sending that stream, `error` event and counter (a 403's reason, as `stream-owner`, when the store gives one), retry every 5 minutes: a request-level 400 (node, stream id), an authentication or ownership failure is a config or agent bug that no replacement can fix |
+| 408, 507, other 5xx (503), network error, timeout (30 s) | exponential backoff 1 s → 5 min, with jitter |
 
 - **Replacement of a refused record.** For `seq = first_seq + record_index`, the agent builds
   a minimal record with the same `seq`, `stream` and `node`:

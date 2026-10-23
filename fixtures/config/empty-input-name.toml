@@ -1,0 +1,6 @@
+node = "node-a"
+spool_limit = 1073741824
+journald = false
+
+[files.""]
+path = "/var/log/kekkai-node.log"
