@@ -380,10 +380,13 @@ impl Spool {
         out.admitted = true;
         let over_limit = self.snapshot().total() >= self.limit;
         let mut buf = Vec::new();
+        // Where the last record starts in `buf`.
+        let mut last = 0;
         if !(reserve && over_limit) {
             let stream = self.state.stream(s).stream.clone();
             let mut seq = out.first_seq;
             for item in items {
+                last = buf.len();
                 let mut record = item.render(&self.node, &stream, seq);
                 if let Err(reason) = item.check(&record) {
                     let fallback = item
@@ -397,6 +400,26 @@ impl Spool {
                 seq += 1;
             }
             out.count = seq - out.first_seq;
+        }
+        // Against the room as accounted now: a batch sized against an older room (another
+        // source committed since) would eat the reserve. It may overshoot by its last record
+        // only, as the sources size it; beyond, it pauses ingestion as it would once written,
+        // without being written (ADR 0004).
+        if !reserve && last as u64 >= self.room() {
+            let mut refused = Commit {
+                first_seq: out.first_seq,
+                ..Commit::default()
+            };
+            for s in Signal::ALL {
+                if !self.is_paused(s) {
+                    self.state.paused.insert(s.name().into(), true);
+                    refused.transitions.push((s, true));
+                }
+            }
+            if !refused.transitions.is_empty() {
+                self.write_state()?;
+            }
+            return Ok(refused);
         }
         if !buf.is_empty() {
             self.open[s.i()].write_all(&buf)?;
@@ -1024,14 +1047,12 @@ mod tests {
         let tmp = tempdir("room");
         let (mut spool, _) = Spool::open(&tmp, "node-a", 2 << 20).unwrap();
         let unbounded: Vec<Pending> = (0..10_000).map(|n| Pending::Log(line(n))).collect();
-        spool
+        let c = spool
             .commit(Signal::Logs, &unbounded, false, |_| {})
             .unwrap();
-        assert!(spool.is_paused(Signal::Metrics) && spool.snapshot().total() > spool.limit);
-        let c = spool
-            .commit(Signal::Metrics, &[skipped()], true, |_| {})
-            .unwrap();
-        assert_eq!(c.count, 0, "an overshooting batch leaves no reserve");
+        // Refused under the lock: it pauses without being written, the reserve is kept.
+        assert!(!c.admitted && spool.is_paused(Signal::Metrics));
+        assert_eq!(spool.snapshot().total(), 0);
 
         // What the sources do: close the batch once its estimate reaches the room.
         let tmp = tempdir("room-bounded");
@@ -1195,9 +1216,10 @@ mod tests {
         let room = spool.room();
         let mut first = Vec::new();
         let mut bytes = 0;
-        while bytes <= room {
-            let p = line(first.len() as u64);
-            bytes += p.render("node-a", &"0".repeat(32), 1).len() as u64 + 1;
+        while bytes < room {
+            let seq = first.len() as u64 + 1;
+            let p = line(seq);
+            bytes += p.render("node-a", &"0".repeat(32), seq).len() as u64 + 1;
             first.push(Pending::Log(p));
         }
         let second = [Pending::Log(line(0))];
@@ -1226,6 +1248,44 @@ mod tests {
             .commit(Signal::Logs, &[event(1)], true, |_| {})
             .unwrap();
         assert!(c.admitted && c.count == 1);
+    }
+
+    #[test]
+    fn batches_that_fit_the_room_alone_but_not_together_keep_the_reserve() {
+        let tmp = tempdir("admission-room");
+        let (mut spool, _) = Spool::open(&tmp, "node-a", 100_000).unwrap();
+        // Two sources read the same room; each batch fits it alone, not both.
+        let room = spool.room();
+        let batch = |from: u64| {
+            let (mut b, mut bytes) = (Vec::new(), 0);
+            while bytes < room * 6 / 10 {
+                let p = line(from + b.len() as u64);
+                bytes += spool.estimate(&p);
+                b.push(Pending::Log(p));
+            }
+            b
+        };
+        let (first, second) = (batch(0), batch(1000));
+        let c = spool.commit(Signal::Logs, &first, false, |_| {}).unwrap();
+        assert!(c.admitted && !spool.is_paused(Signal::Logs));
+        let total = spool.snapshot().total();
+        let c = spool
+            .commit(Signal::Logs, &second, false, |st| {
+                st.journal_cursor = Some("b".into())
+            })
+            .unwrap();
+        assert!(!c.admitted && c.count == 0);
+        assert_eq!(
+            c.transitions,
+            [(Signal::Logs, true), (Signal::Metrics, true)]
+        );
+        assert!(spool.is_paused(Signal::Logs) && spool.is_paused(Signal::Metrics));
+        assert_eq!(spool.snapshot().total(), total, "nothing written");
+        assert_eq!(spool.state.journal_cursor, None, "position kept");
+        let c = spool
+            .commit(Signal::Metrics, &[skipped()], true, |_| {})
+            .unwrap();
+        assert!(c.admitted && c.count == 1, "the reserve is untouched");
     }
 
     #[test]

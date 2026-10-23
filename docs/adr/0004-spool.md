@@ -41,6 +41,9 @@ Full-spool policies:
   - metrics: no scrapes; one `error:"skipped-spool-full"` record per target when pausing
     starts, `hikyaku_scrapes_total{result="skipped"}` counted locally.
   - 1 % of the limit stays reserved for the agent's own events.
+  - admission is checked under the spool's lock against the room left at that moment: a batch
+    that no longer fits (another source committed since it was sized) pauses ingestion
+    without being written, and the source reads it again after the pause.
   - ingestion resumes below 90 % of the limit.
 - Visibility: `hikyaku_spool_paused{signal}` = 1, `spool-full` event, `warn` in the agent's own
   journal, `paused` in every push request (stores expose it in `/v1/status`).

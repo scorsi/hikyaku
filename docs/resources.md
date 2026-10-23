@@ -42,7 +42,20 @@ While connected the spool holds seconds of data: an open segment is emptied once
   one record over it. These are per collector, with no global budget. Worst case not yet
   measured under the 64 MiB cgroup.
 - Compression of a closed 16 MiB segment: well under a second, once per segment.
+- A push batch is decompressed under the spool's global lock: collectors wait for it.
 - CPU below 1 % of one core on average.
+
+## Disk budget
+
+`spoolLimit` counts the segments and the replacement records at their raw length. Not
+counted: `state.json` itself, the JSON escaping of the replacements it holds, and its second
+copy `state.json.tmp` while it is written.
+
+## Input files
+
+The file tailer refuses a symlink as the last path component but follows symlinks in the
+parent directories (no `O_NOFOLLOW` on them). Accepted: the paths come from the operator's Nix
+configuration, not from a third party.
 
 ## journald
 

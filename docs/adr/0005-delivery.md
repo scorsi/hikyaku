@@ -45,6 +45,9 @@ implementations must cost one record, not a stream.
 | 400 without `record_index`, 401 with the same token, 403, other 4xx | stop sending that stream, `error` event and counter (a 403's reason, as `stream-owner`, when the store gives one), retry every 5 minutes: a request-level 400 (node, stream id), an authentication or ownership failure is a config or agent bug that no replacement can fix |
 | 408, 507, other 5xx (503), network error, timeout (30 s) | exponential backoff 1 s → 5 min, with jitter |
 
+On NixOS the token file is the systemd credential copied when the service starts: re-reading
+it after a 401 sees a rotation only once the service restarts (sops-nix `restartUnits`).
+
 - **Replacement of a refused record.** For `seq = first_seq + record_index`, the agent builds
   a minimal record with the same `seq`, `stream` and `node`:
   - logs (nisshi): `level:"error"`, `event:"rejected"`, `err` = the store's reason,
