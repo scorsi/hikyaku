@@ -19,14 +19,14 @@
     # The stores: their protos are compiled here, their fixtures run against this agent's
     # validators (ADR 0001, 0008). Locally: `--override-input masu path:../masu` (same for nisshi).
     masu = {
-      url = "git+ssh://git@forgejo.uchi.scorsi.dev:2222/scorsi/masu.git";
+      url = "git+https://kajiba.uchi.scorsi.dev/scorsi/masu.git";
       inputs.nixpkgs.follows = "nixpkgs";
       inputs.flake-parts.follows = "flake-parts";
       inputs.treefmt-nix.follows = "treefmt-nix";
       inputs.crane.follows = "crane";
     };
     nisshi = {
-      url = "git+ssh://git@forgejo.uchi.scorsi.dev:2222/scorsi/nisshi.git";
+      url = "git+https://kajiba.uchi.scorsi.dev/scorsi/nisshi.git";
       inputs.nixpkgs.follows = "nixpkgs";
       inputs.flake-parts.follows = "flake-parts";
       inputs.treefmt-nix.follows = "treefmt-nix";
