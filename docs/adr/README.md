@@ -18,3 +18,4 @@ Decision / Consequences. A decision is changed by a new ADR that supersedes the 
 | [0011](0011-journald-resume.md) | journald resume: `--cursor` and `--boot=all` |
 | [0012](0012-empty-acked-open-segment.md) | A fully acked open segment is emptied at once |
 | [0013](0013-replacement-size-budget.md) | Records sized so that their replacement fits |
+| [0014](0014-journald-fields.md) | Wrapped journald lines keep a fixed set of journald fields |
